@@ -2,11 +2,28 @@
   "name": "@flurdy/pi-watch-loop",
   "version": "0.1.0",
   "private": true,
+  "description": "In-memory protocol-v1 fixed and adaptive watch loops for Pi",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/flurdy/pi-watch-loop.git"
+  },
   "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "watch-loop",
+    "scheduling"
+  ],
   "engines": {
     "node": ">=22.19"
   },
+  "files": [
+    "README.md",
+    "docs/protocol.md",
+    "index.ts",
+    "watch-loop.ts"
+  ],
   "pi": {
     "extensions": [
       "./index.ts"
@@ -14,7 +31,10 @@
   },
   "scripts": {
     "test": "tsx --test *.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "pack:check": "node scripts/check-package.mjs",
+    "check": "npm test && npm run typecheck && npm run pack:check",
+    "verify:git-install": "scripts/verify-git-install.sh"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -22,11 +42,11 @@
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.82.1",
-    "@earendil-works/pi-coding-agent": "0.82.1",
-    "@types/node": "^24.12.0",
-    "tsx": "^4.20.0",
-    "typebox": "1.1.38",
-    "typescript": "^5.9.0"
+    "@earendil-works/pi-ai": "0.85.0",
+    "@earendil-works/pi-coding-agent": "0.85.0",
+    "@types/node": "24.12.0",
+    "tsx": "4.20.6",
+    "typebox": "1.3.7",
+    "typescript": "5.9.3"
   }
 }
