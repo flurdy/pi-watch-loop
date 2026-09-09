@@ -16,9 +16,9 @@ const watchCommands = commandsResponse.data.commands.filter(
 assert.deepEqual(
 	watchCommands.map(({ name, source }) => ({ name, source })),
 	[
-		{ name: "watch-resume", source: "extension" },
 		{ name: "watch-status", source: "extension" },
 		{ name: "watch-stop", source: "extension" },
+		{ name: "watch-resume", source: "extension" },
 	],
 	"watch-loop commands were not loaded exactly once from the extension",
 );
