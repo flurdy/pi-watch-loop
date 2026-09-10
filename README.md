@@ -59,7 +59,7 @@ fnm exec --using=.nvmrc npm run verify:git-install
 
 This repository owns only the generic protocol controller and Pi adapter. Workflow-specific cadence, dashboards, deployment checks, and attended decisions remain in their consuming skills.
 
-The component was extracted from `flurdy/ai-tools` with its three path-scoped commits preserved. See [the extraction history](docs/extraction-history.md).
+The component was extracted from `flurdy/ai-tools` with its three path-scoped commits preserved. See [the extraction history](https://github.com/flurdy/pi-watch-loop/blob/main/docs/extraction-history.md).
 
 ## Rollback
 

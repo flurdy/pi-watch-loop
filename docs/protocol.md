@@ -126,8 +126,8 @@ ordering, because RPC and fake-host tests cannot prove those terminal lifecycle 
 smoke output under ignored `.artifacts/`; retain only the Pi version, commit, observed protocol states,
 and duplicate-dispatch count when recording durable evidence.
 
-**Current-Pi smoke:** On 2026-09-09, Pi 0.85.0 loaded immutable Git package commit
-`eaeebd6f10623d90637d7b174564f97fbab46810`. `/watch-status` reported protocol 1 idle; a fixed watch
+**Current-Pi smoke:** On 2026-09-10 (02:30–02:33 UTC), Pi 0.85.0 loaded immutable Git package commit
+`eaeebd6f10623d90637d7b174564f97fbab46810`. `watch_loop status` reported protocol 1 idle; a fixed watch
 bounded to one tick armed for the real 60-second minimum, injected generation 1 once, preserved one
 visible dashboard line before terminating completion, and stopped with `Ticks: 1/1` and zero misses.
 A following status remained stopped; no duplicate prompt dispatch was observed.

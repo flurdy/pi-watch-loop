@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -29,4 +29,13 @@ const files = report[0].files.map((entry) => entry.path).sort();
 const expectedFiles = ["LICENSE", "package.json", ...runtimeFiles].sort();
 assert.deepEqual(files, expectedFiles, "npm package contents differ from the exact allowlist");
 
-console.log(`Package allowlist verified (${files.length} files).`);
+for (const file of files.filter((path) => path.endsWith(".md"))) {
+	const markdown = readFileSync(resolve(repositoryRoot, file), "utf8");
+	for (const [, link] of markdown.matchAll(/\]\(([^)]+)\)/g)) {
+		if (/^[a-z][a-z0-9+.-]*:|^#/i.test(link)) continue;
+		const target = posix.join(posix.dirname(file), link.split("#")[0]);
+		assert.ok(files.includes(target), `${file} links to unpackaged file ${target}`);
+	}
+}
+
+console.log(`Package allowlist and documentation links verified (${files.length} files).`);
