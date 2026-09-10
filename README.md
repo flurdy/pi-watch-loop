@@ -9,6 +9,10 @@ See [the protocol and lifecycle contract](docs/protocol.md) for tool fields, sta
 - Pi 0.85.0 or newer
 - Node.js 22.19 or newer for development
 
+Pi supplies `@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, and `typebox` at runtime,
+so their peer ranges intentionally accept the host versions instead of bundling another Pi core.
+Development dependencies are pinned to the supported Pi baseline for reproducible typechecking.
+
 ## Install
 
 Pin an immutable commit or tag:
