@@ -121,10 +121,16 @@ and the exact npm-package allowlist. `verify:git-install` requires a clean commi
 that immutable commit through an isolated localhost Git server and Pi agent directory; it proves one
 copy of each extension command loads and `/watch-status` reports protocol 1 idle state.
 
-A focused real-TUI smoke is still required for timer-originated prompt delivery and visible completion
+A focused real-TUI smoke is required for timer-originated prompt delivery and visible completion
 ordering, because RPC and fake-host tests cannot prove those terminal lifecycle boundaries. Keep raw
 smoke output under ignored `.artifacts/`; retain only the Pi version, commit, observed protocol states,
 and duplicate-dispatch count when recording durable evidence.
+
+**Current-Pi smoke:** On 2026-09-09, Pi 0.85.0 loaded immutable Git package commit
+`eaeebd6f10623d90637d7b174564f97fbab46810`. `/watch-status` reported protocol 1 idle; a fixed watch
+bounded to one tick armed for the real 60-second minimum, injected generation 1 once, preserved one
+visible dashboard line before terminating completion, and stopped with `Ticks: 1/1` and zero misses.
+A following status remained stopped; no duplicate prompt dispatch was observed.
 
 ## Installation and rollback
 
