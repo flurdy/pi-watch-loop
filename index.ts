@@ -14,6 +14,10 @@ import {
 } from "./watch-loop.ts";
 
 const STATUS_KEY = "pi-watch-loop";
+const DEFAULT_CONTEXT_ADVICE_PERCENT = 50;
+const CONTEXT_ADVICE_BAND_PERCENT = 10;
+const COMPACTION_RECHECK_MILLISECONDS = 1_000;
+const COMPACTION_RECHECKS = 10;
 
 const watchLoopParameters = Type.Object({
 	action: StringEnum(["status", "start", "complete", "stop"] as const),
@@ -42,6 +46,16 @@ export interface WatchLoopControllerDependencies {
 	clearTimer: (timer: ReturnType<typeof setTimeout>) => void;
 	createWatchId: () => string;
 	isDisabled: () => boolean;
+	/** Percent at which compaction advice starts, or undefined when advice is off. */
+	contextAdviceThreshold: () => number | undefined;
+}
+
+/** Unset or invalid values use the default; `0` or `off` disables advice. */
+export function parseContextAdviceThreshold(value: string | undefined): number | undefined {
+	const trimmed = value?.trim().toLowerCase() ?? "";
+	if (trimmed === "0" || trimmed === "off") return undefined;
+	if (!/^[0-9]{1,2}$/.test(trimmed)) return DEFAULT_CONTEXT_ADVICE_PERCENT;
+	return Number(trimmed);
 }
 
 const defaultDependencies: WatchLoopControllerDependencies = {
@@ -50,6 +64,7 @@ const defaultDependencies: WatchLoopControllerDependencies = {
 	clearTimer: (timer) => clearTimeout(timer),
 	createWatchId: randomUUID,
 	isDisabled: () => process.env.PI_WATCH_LOOP_DISABLED === "1",
+	contextAdviceThreshold: () => parseContextAdviceThreshold(process.env.PI_WATCH_LOOP_CONTEXT_PERCENT),
 };
 
 function requiredNumber(value: number | undefined, name: string): number {
@@ -110,6 +125,17 @@ export function formatWatchStatus(state: WatchLoopState, now = Date.now()): stri
 	return lines.join("\n");
 }
 
+function formatContextStatus(ctx: ExtensionContext, threshold: number | undefined): string {
+	const usage = ctx.getContextUsage();
+	const percent = usage?.percent;
+	return [
+		`Context advice: ${threshold === undefined ? "off" : `from ${threshold}%`}`,
+		typeof percent === "number" && usage
+			? `Context: ${Math.floor(percent)}% of ${usage.contextWindow} tokens`
+			: "Context: unknown",
+	].join("\n");
+}
+
 function footerStatus(state: WatchLoopState, now: number): string | undefined {
 	const label = state.watch?.label;
 	if (!label || state.status === "idle" || state.status === "stopped") return undefined;
@@ -126,6 +152,7 @@ export class WatchLoopController {
 	private deadlineTimer: ReturnType<typeof setTimeout> | undefined;
 	private deadlineTimerToken = 0;
 	private currentContext: ExtensionContext | undefined;
+	private contextAdvice: { watchId: string; band: number } | undefined;
 
 	constructor(
 		private readonly pi: ExtensionAPI,
@@ -150,16 +177,50 @@ export class WatchLoopController {
 
 	onAgentSettled(ctx: ExtensionContext): void {
 		this.currentContext = ctx;
-		if (this.currentState.status !== "running" && !(this.currentState.status === "armed" && this.currentState.due)) {
-			return;
+		if (this.currentState.status === "running" || this.isDue()) {
+			this.apply(
+				reduceWatchLoop(this.currentState, {
+					type: "agent_settled",
+					now: this.dependencies.now(),
+					canDispatch: canDispatch(ctx),
+				}),
+				ctx,
+			);
 		}
-		this.apply(
-			reduceWatchLoop(this.currentState, {
-				type: "agent_settled",
-				now: this.dependencies.now(),
-				canDispatch: canDispatch(ctx),
-			}),
-			ctx,
+		this.adviseContext(ctx);
+	}
+
+	/**
+	 * Manual compaction keeps Pi busy without a following agent_settled event, so a tick that fell
+	 * due meanwhile is rechecked briefly through the normal timer path once compaction can finish.
+	 */
+	onManualCompactionEnded(ctx: ExtensionContext): void {
+		this.currentContext = ctx;
+		if (this.isDue()) this.scheduleTick(COMPACTION_RECHECK_MILLISECONDS, COMPACTION_RECHECKS - 1);
+	}
+
+	formatContextStatus(ctx: ExtensionContext): string {
+		return formatContextStatus(ctx, this.dependencies.contextAdviceThreshold());
+	}
+
+	private isDue(): boolean {
+		return this.currentState.status === "armed" && this.currentState.due;
+	}
+
+	private adviseContext(ctx: ExtensionContext): void {
+		const { status, watch } = this.currentState;
+		const threshold = this.dependencies.contextAdviceThreshold();
+		if (threshold === undefined || !watch || !["armed", "running", "paused"].includes(status)) return;
+		const percent = ctx.getContextUsage()?.percent;
+		if (typeof percent !== "number" || !Number.isFinite(percent)) return;
+
+		const band = percent >= threshold ? Math.floor((percent - threshold) / CONTEXT_ADVICE_BAND_PERCENT) : -1;
+		const advisedBand = this.contextAdvice?.watchId === watch.id ? this.contextAdvice.band : -1;
+		this.contextAdvice = { watchId: watch.id, band };
+		if (band <= advisedBand || !ctx.hasUI) return;
+		ctx.ui.notify(
+			`Watch "${watch.label}": context ${Math.floor(percent)}% (advice from ${threshold}%). Consider /compact while Pi is idle; the watch keeps its schedule.`,
+			"info",
 		);
 	}
 
@@ -209,7 +270,7 @@ export class WatchLoopController {
 		this.updateFooter(ctx);
 	}
 
-	private scheduleTick(delayMilliseconds: number): void {
+	private scheduleTick(delayMilliseconds: number, rechecks = 0): void {
 		this.clearTickTimer();
 		const token = this.tickTimerToken;
 		this.tickTimer = this.dependencies.setTimer(() => {
@@ -226,6 +287,7 @@ export class WatchLoopController {
 				}),
 				ctx,
 			);
+			if (rechecks > 0 && this.isDue()) this.scheduleTick(COMPACTION_RECHECK_MILLISECONDS, rechecks - 1);
 		}, delayMilliseconds);
 	}
 
@@ -392,7 +454,10 @@ export function registerWatchLoopExtension(
 		description: "Show the current in-memory watch-loop state",
 		handler: async (_args, ctx) => {
 			controller.bind(ctx);
-			ctx.ui.notify(formatWatchStatus(controller.state, dependencies.now()), "info");
+			ctx.ui.notify(
+				`${formatWatchStatus(controller.state, dependencies.now())}\n${controller.formatContextStatus(ctx)}`,
+				"info",
+			);
 		},
 	});
 
@@ -418,6 +483,12 @@ export function registerWatchLoopExtension(
 
 	pi.on("session_start", (_event, ctx) => controller.bind(ctx));
 	pi.on("agent_settled", (_event, ctx) => controller.onAgentSettled(ctx));
+	pi.on("session_compact", (event, ctx) => {
+		if (event.reason === "manual") controller.onManualCompactionEnded(ctx);
+	});
+	pi.on("session_compact_failed", (event, ctx) => {
+		if (event.reason === "manual") controller.onManualCompactionEnded(ctx);
+	});
 	pi.on("session_tree", (_event, ctx) => controller.shutdown(ctx, "session tree changed"));
 	pi.on("session_shutdown", (_event, ctx) => controller.shutdown(ctx));
 

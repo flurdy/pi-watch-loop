@@ -39,6 +39,8 @@ Watch skills normally drive the `watch_loop` tool. Inspect the idle or active pr
 
 Other local commands are `/watch-stop` and `/watch-resume`. Set `PI_WATCH_LOOP_DISABLED=1` before starting Pi to refuse new watches while keeping status and stop access.
 
+While a watch is active, a notification suggests `/compact` once context usage reaches 50%, then again at each further 10-point band. Set `PI_WATCH_LOOP_CONTEXT_PERCENT` to another threshold from 1 to 99, or to `off`. See [context advice](docs/protocol.md#context-advice).
+
 ## Development
 
 Use the Node version in `.nvmrc`:

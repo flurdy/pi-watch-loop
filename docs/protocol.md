@@ -72,13 +72,43 @@ Deadline evaluation wins over overdue dispatch. Deadline and tick budget are che
 
 ## Commands and status
 
-- `/watch-status` — protocol, state, mode, next run/due state, tick count, misses, reason, deadline/budget/indefinite bound.
+- `/watch-status` — protocol, state, mode, next run/due state, tick count, misses, reason, deadline/budget/indefinite bound, context advice threshold, and current estimated context usage.
 - `/watch-stop` — stop locally and invalidate a running generation.
 - `/watch-resume` — resume a paused watcher with one immediate generation.
 
 TUI mode also shows a compact footer status such as `watch: PRs · 2m`, `watch: PRs · running`, or `watch: PRs · paused`.
 
 Set `PI_WATCH_LOOP_DISABLED=1` before starting Pi to refuse new watches while preserving status and stop access.
+
+## Context advice
+
+Every tick adds its dashboard and tool output to the session, while Pi auto-compacts only near the
+full context window (`contextTokens > contextWindow - reserveTokens`). After each `agent_settled`
+while a watch is armed, running, or paused, the extension reads `ctx.getContextUsage()` and shows a
+non-blocking TUI notification suggesting `/compact` while Pi is idle once usage reaches the threshold.
+
+- `PI_WATCH_LOOP_CONTEXT_PERCENT` sets the threshold before Pi starts: an integer from 1 to 99.
+  Unset or invalid values use 50; `0` or `off` disables advice.
+- Advice repeats only for each further 10-point band, such as 50%, 60%, and 70%, per watch.
+  A lower reading, for example after compaction or a larger-window model, re-arms lower bands.
+- Unknown usage, such as immediately after compaction, stays silent. No watch means no advice.
+- Advice adds no model turn and never changes tick prompts, tool results, the footer, or protocol-v1
+  tokens. The extension never compacts; automatic compaction remains owned by Pi.
+
+Pi's `compaction.reserveTokens` setting can trigger automatic compaction earlier, but it applies to
+every session rather than only watched ones.
+
+## Compaction
+
+- **Manual `/compact` while armed or paused:** state, deadline, budget, and footer are unchanged.
+  A tick timer that expires during compaction records the usual due marker. Because manual
+  compaction emits no `agent_settled`, its successful or failed end rechecks that due tick once per
+  second for up to ten seconds and dispatches it once Pi is idle. Otherwise the next `agent_settled`
+  dispatches it as before.
+- **Manual `/compact` during a running tick:** Pi aborts the current turn before compacting. The tick
+  settles without `watch_loop complete` and follows the normal missed-completion policy.
+- **Automatic threshold or overflow compaction:** Pi compacts inside the running agent run and emits
+  one final `agent_settled`, so a tick continues and completes normally without a recorded miss.
 
 ## Lifecycle and cost boundary
 
@@ -116,7 +146,7 @@ npm run check
 npm run verify:git-install
 ```
 
-`check` runs the 33 protocol/adapter tests, typechecking against the pinned development Pi version,
+`check` runs the 42 protocol/adapter tests, typechecking against the pinned development Pi version,
 and the exact npm-package allowlist. `verify:git-install` requires a clean committed tree and installs
 that immutable commit through an isolated localhost Git server and Pi agent directory; it proves one
 copy of each extension command loads and `/watch-status` reports protocol 1 idle state.

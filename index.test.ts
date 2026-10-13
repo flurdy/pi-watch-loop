@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type {
+	ContextUsage,
 	ExtensionAPI,
 	ExtensionContext,
 	RegisteredCommand,
@@ -8,13 +9,15 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
 	formatWatchStatus,
+	parseContextAdviceThreshold,
 	registerWatchLoopExtension,
 	type WatchLoopControllerDependencies,
 } from "./index.ts";
 
 const NOW = Date.UTC(2026, 6, 30, 12, 0, 0);
 
-type EventHandler = (event: { type: string }, ctx: ExtensionContext) => unknown;
+type HostEvent = { type: string; reason?: string };
+type EventHandler = (event: HostEvent, ctx: ExtensionContext) => unknown;
 
 class FakePi {
 	readonly tools = new Map<string, ToolDefinition>();
@@ -42,8 +45,8 @@ class FakePi {
 		this.messages.push(prompt);
 	}
 
-	async emit(name: string, ctx: ExtensionContext): Promise<void> {
-		for (const handler of this.events.get(name) ?? []) await handler({ type: name }, ctx);
+	async emit(name: string, ctx: ExtensionContext, fields: Omit<HostEvent, "type"> = {}): Promise<void> {
+		for (const handler of this.events.get(name) ?? []) await handler({ type: name, ...fields }, ctx);
 	}
 }
 
@@ -83,15 +86,23 @@ interface UiProbe {
 	notifications: Array<{ message: string; level: string }>;
 }
 
-function context(probe: UiProbe, mode: ExtensionContext["mode"] = "tui"): ExtensionContext & { idle: boolean; pending: boolean } {
+type TestContext = ExtensionContext & { idle: boolean; pending: boolean; usage: ContextUsage | undefined };
+
+function usage(percent: number | null): ContextUsage {
+	return { tokens: percent === null ? null : percent * 2_000, contextWindow: 200_000, percent };
+}
+
+function context(probe: UiProbe, mode: ExtensionContext["mode"] = "tui"): TestContext {
 	const ctx = {
 		mode,
 		hasUI: mode === "tui" || mode === "rpc",
 		cwd: "/tmp/watch-loop",
 		idle: true,
 		pending: false,
+		usage: undefined,
 		isIdle: () => ctx.idle,
 		hasPendingMessages: () => ctx.pending,
+		getContextUsage: () => ctx.usage,
 		ui: {
 			setStatus(_key: string, value: string | undefined) {
 				probe.statuses.push(value);
@@ -100,21 +111,23 @@ function context(probe: UiProbe, mode: ExtensionContext["mode"] = "tui"): Extens
 				probe.notifications.push({ message, level });
 			},
 		},
-	} as unknown as ExtensionContext & { idle: boolean; pending: boolean };
+	} as unknown as TestContext;
 	return ctx;
 }
 
-function harness(options: { disabled?: boolean } = {}) {
+function harness(options: { disabled?: boolean; contextThreshold?: number | undefined } = {}) {
 	const pi = new FakePi();
 	const timers = new FakeTimers();
 	const probe: UiProbe = { statuses: [], notifications: [] };
 	let now = NOW;
+	let watchCount = 0;
 	const dependencies: WatchLoopControllerDependencies = {
 		now: () => now,
 		setTimer: timers.setTimer,
 		clearTimer: timers.clearTimer,
-		createWatchId: () => "watch-1",
+		createWatchId: () => `watch-${++watchCount}`,
 		isDisabled: () => options.disabled === true,
+		contextAdviceThreshold: () => ("contextThreshold" in options ? options.contextThreshold : 50),
 	};
 	const controller = registerWatchLoopExtension(pi as unknown as ExtensionAPI, dependencies);
 	return { pi, timers, probe, controller, setNow: (value: number) => (now = value) };
@@ -361,4 +374,207 @@ test("status text exposes cadence, budget, misses, reason, and explicit bounds",
 	assert.match(text, /Consecutive misses: 0/);
 	assert.match(text, /Deadline: 2026-/);
 	assert.match(text, /Last reason: watch started/);
+	assert.doesNotMatch(text, /Context/);
+});
+
+function contextNotices(probe: UiProbe): string[] {
+	return probe.notifications.map((notice) => notice.message).filter((message) => /context/i.test(message));
+}
+
+test("parses the context advice threshold strictly and falls back to 50", () => {
+	for (const value of [undefined, "", "  ", "50junk", "1.5", "100", "-1", "5e1", "０５"]) {
+		assert.equal(parseContextAdviceThreshold(value), 50, String(value));
+	}
+	for (const value of ["0", "off", " OFF "]) assert.equal(parseContextAdviceThreshold(value), undefined, value);
+	assert.equal(parseContextAdviceThreshold("1"), 1);
+	assert.equal(parseContextAdviceThreshold(" 70 "), 70);
+	assert.equal(parseContextAdviceThreshold("99"), 99);
+});
+
+test("suggests compaction once per 10-point band without touching tick prompts", async () => {
+	const { pi, timers, probe, controller, setNow } = harness();
+	const ctx = context(probe);
+	ctx.usage = usage(80);
+	await pi.emit("agent_settled", ctx);
+	assert.deepEqual(contextNotices(probe), [], "no watch, no advice");
+
+	await callTool(pi, startParams(), ctx);
+	const readings: Array<number | null> = [49.9, 50, 59.9, 72, null, 79.9, 80.2];
+	const counts: number[] = [];
+	for (const percent of readings) {
+		ctx.usage = usage(percent);
+		await pi.emit("agent_settled", ctx);
+		counts.push(contextNotices(probe).length);
+	}
+	assert.deepEqual(counts, [0, 1, 1, 2, 2, 2, 3]);
+	assert.match(contextNotices(probe)[0] ?? "", /Watch "PRs": context 50% \(advice from 50%\)\. Consider \/compact/);
+	assert.match(contextNotices(probe)[1] ?? "", /context 72%/);
+	assert.ok(probe.notifications.every((notice) => notice.level === "info" || !/context/.test(notice.message)));
+
+	ctx.usage = undefined;
+	await pi.emit("agent_settled", ctx);
+	assert.equal(contextNotices(probe).length, 3, "missing usage stays silent");
+	assert.equal(pi.messages.length, 0);
+	assert.equal(controller.state.status, "armed");
+	assert.equal(timers.active()[0]?.delay, 60_000);
+
+	setNow(NOW + 60_000);
+	timers.fire(0);
+	assert.equal(pi.messages.length, 1);
+	assert.doesNotMatch(pi.messages[0] ?? "", /context|compact/i);
+});
+
+test("a lower reading after compaction re-arms advice for the same watch", async () => {
+	const { pi, probe } = harness();
+	const ctx = context(probe);
+	await callTool(pi, startParams(), ctx);
+	for (const percent of [65, null, 30, 51, 64]) {
+		ctx.usage = usage(percent);
+		await pi.emit("agent_settled", ctx);
+	}
+	assert.deepEqual(contextNotices(probe).map((message) => message.match(/context (\d+)%/)?.[1]), ["65", "51", "64"]);
+});
+
+test("advice is per watch and covers paused watches but not stopped ones", async () => {
+	const { pi, timers, probe, controller, setNow } = harness();
+	const ctx = context(probe);
+	await callTool(pi, startParams({ missedCompletionPolicy: "pause" }), ctx);
+	ctx.usage = usage(55);
+	setNow(NOW + 60_000);
+	timers.fire(0);
+	assert.equal(controller.state.status, "running");
+	await pi.emit("agent_settled", ctx);
+	assert.equal(controller.state.status, "paused");
+	assert.equal(contextNotices(probe).length, 1);
+
+	const stop = pi.commands.get("watch-stop");
+	assert.ok(stop);
+	await stop.handler("", ctx as never);
+	await pi.emit("agent_settled", ctx);
+	assert.equal(contextNotices(probe).length, 1, "stopped watch stays silent");
+
+	await callTool(pi, startParams(), ctx);
+	assert.equal(controller.state.watch?.id, "watch-2");
+	await pi.emit("agent_settled", ctx);
+	assert.equal(contextNotices(probe).length, 2, "a new watch starts a fresh band history");
+});
+
+test("disabled advice stays silent and non-UI modes never notify", async () => {
+	const disabled = harness({ contextThreshold: undefined });
+	const ctx = context(disabled.probe);
+	await callTool(disabled.pi, startParams(), ctx);
+	ctx.usage = usage(95);
+	await disabled.pi.emit("agent_settled", ctx);
+	assert.deepEqual(contextNotices(disabled.probe), []);
+
+	const enabled = harness({ contextThreshold: 70 });
+	const tui = context(enabled.probe);
+	await callTool(enabled.pi, startParams(), tui);
+	tui.usage = usage(69);
+	await enabled.pi.emit("agent_settled", tui);
+	assert.deepEqual(contextNotices(enabled.probe), []);
+	const print = context(enabled.probe, "print");
+	print.usage = usage(90);
+	await enabled.pi.emit("agent_settled", print);
+	assert.deepEqual(contextNotices(enabled.probe), []);
+});
+
+test("/watch-status reports context advice and current usage without changing tool output", async () => {
+	const { pi, probe } = harness();
+	const ctx = context(probe);
+	const status = pi.commands.get("watch-status");
+	assert.ok(status);
+	await status.handler("", ctx as never);
+	assert.match(probe.notifications.at(-1)?.message ?? "", /Context advice: from 50%\nContext: unknown/);
+	ctx.usage = usage(61.4);
+	await status.handler("", ctx as never);
+	assert.match(probe.notifications.at(-1)?.message ?? "", /Context: 61% of 200000 tokens/);
+	const result = await callTool(pi, { action: "status" }, ctx);
+	assert.doesNotMatch(result.content[0]?.type === "text" ? result.content[0].text : "", /Context/);
+
+	const off = harness({ contextThreshold: undefined });
+	const offStatus = off.pi.commands.get("watch-status");
+	assert.ok(offStatus);
+	await offStatus.handler("", context(off.probe) as never);
+	assert.match(off.probe.notifications.at(-1)?.message ?? "", /Context advice: off/);
+});
+
+test("a tick that falls due during manual compaction dispatches once compaction ends", async () => {
+	const { pi, timers, probe, controller, setNow } = harness();
+	const ctx = context(probe);
+	await callTool(pi, startParams({ maxTicks: undefined, stopAt: new Date(NOW + 3_600_000).toISOString() }), ctx);
+	assert.equal(timers.active().length, 2);
+
+	ctx.idle = false;
+	setNow(NOW + 60_000);
+	timers.fire(0);
+	assert.equal(controller.state.due, true);
+	assert.match(probe.statuses.at(-1) ?? "", /due/);
+
+	await pi.emit("session_compact", ctx, { reason: "manual" });
+	const recheck = timers.timers.length - 1;
+	assert.equal(timers.timers[recheck]?.delay, 1_000);
+	timers.fire(recheck);
+	assert.equal(controller.state.due, true, "still compacting");
+	assert.equal(pi.messages.length, 0);
+
+	ctx.idle = true;
+	timers.fire(timers.timers.length - 1);
+	assert.equal(controller.state.status, "running");
+	assert.equal(pi.messages.length, 1);
+	assert.equal(timers.active().length, 1, "only the deadline timer remains");
+	assert.equal(timers.active()[0]?.delay, 3_600_000);
+
+	timers.fire(recheck);
+	await pi.emit("session_compact", ctx, { reason: "manual" });
+	assert.equal(pi.messages.length, 1, "stale or duplicate rechecks never redispatch");
+});
+
+test("failed manual compaction also rechecks and stops after a bounded number of attempts", async () => {
+	const { pi, timers, probe, controller, setNow } = harness();
+	const ctx = context(probe);
+	await callTool(pi, startParams(), ctx);
+	ctx.idle = false;
+	setNow(NOW + 60_000);
+	timers.fire(0);
+	await pi.emit("session_compact_failed", ctx, { reason: "manual" });
+	let fired = 0;
+	while (timers.active().length > 0 && fired < 20) {
+		timers.fire(timers.timers.indexOf(timers.active()[0] as never));
+		fired += 1;
+	}
+	assert.equal(fired, 10);
+	assert.equal(controller.state.status, "armed");
+	assert.equal(controller.state.due, true);
+
+	ctx.idle = true;
+	await pi.emit("agent_settled", ctx);
+	assert.equal(pi.messages.length, 1, "the next settle still dispatches the due tick");
+});
+
+test("compaction leaves scheduled, paused, and auto-compacted watches untouched", async () => {
+	const { pi, timers, probe, controller, setNow } = harness();
+	const ctx = context(probe);
+	await callTool(pi, startParams({ missedCompletionPolicy: "pause" }), ctx);
+	await pi.emit("session_compact", ctx, { reason: "manual" });
+	assert.equal(timers.timers.length, 1);
+	assert.equal(timers.active()[0]?.delay, 60_000);
+	assert.equal(controller.state.due, false);
+
+	ctx.idle = false;
+	setNow(NOW + 60_000);
+	timers.fire(0);
+	assert.equal(controller.state.due, true);
+	for (const reason of ["threshold", "overflow"]) await pi.emit("session_compact", ctx, { reason });
+	assert.equal(timers.active().length, 0, "automatic compaction runs inside an agent run that still settles");
+
+	ctx.idle = true;
+	await pi.emit("agent_settled", ctx);
+	assert.equal(controller.state.status, "running");
+	await pi.emit("agent_settled", ctx);
+	assert.equal(controller.state.status, "paused");
+	await pi.emit("session_compact", ctx, { reason: "manual" });
+	assert.equal(controller.state.status, "paused");
+	assert.equal(timers.active().length, 0);
+	assert.equal(pi.messages.length, 1);
 });
