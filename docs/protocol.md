@@ -162,6 +162,14 @@ bounded to one tick armed for the real 60-second minimum, injected generation 1 
 visible dashboard line before terminating completion, and stopped with `Ticks: 1/1` and zero misses.
 A following status remained stopped; no duplicate prompt dispatch was observed.
 
+**Context advice and compaction smoke:** On 2026-10-13, Pi 1.1.0 loaded commit
+`6856ad31a936f3a40aefee4e30cf74f5cb70f926` as the only extension, with the advice threshold set to 1%.
+`/watch-status` reported the threshold and current usage. A notification appeared once at 2% during
+an armed watch; none appeared after the watch stopped. In a fixed 60-second watch, manual `/compact`
+started 7 seconds before the tick. The footer changed to `due` at expiry. Compaction finished
+24 seconds later; the tick dispatched within one second, then completed. Both watches stopped at
+their tick budgets with zero misses. No duplicate dispatch was observed.
+
 ## Installation and rollback
 
 See the repository [README](../README.md) for immutable Git and local-checkout installation. Roll back
