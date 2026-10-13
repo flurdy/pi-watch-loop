@@ -11,7 +11,8 @@ See [the protocol and lifecycle contract](docs/protocol.md) for tool fields, sta
 
 Pi supplies `@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, and `typebox` at runtime,
 so their peer ranges intentionally accept the host versions instead of bundling another Pi core.
-Development dependencies are pinned to the supported Pi baseline for reproducible typechecking.
+Development dependencies are pinned to Pi 0.99.1 for reproducible typechecking and its patched
+`undici` dependency. This development pin does not change the host-supplied runtime peers.
 
 ## Install
 

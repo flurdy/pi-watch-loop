@@ -4,6 +4,7 @@ import type {
 	ContextUsage,
 	ExtensionAPI,
 	ExtensionContext,
+	ExtensionToolContext,
 	RegisteredCommand,
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
@@ -86,7 +87,7 @@ interface UiProbe {
 	notifications: Array<{ message: string; level: string }>;
 }
 
-type TestContext = ExtensionContext & { idle: boolean; pending: boolean; usage: ContextUsage | undefined };
+type TestContext = ExtensionToolContext & { idle: boolean; pending: boolean; usage: ContextUsage | undefined };
 
 function usage(percent: number | null): ContextUsage {
 	return { tokens: percent === null ? null : percent * 2_000, contextWindow: 200_000, percent };
@@ -103,6 +104,8 @@ function context(probe: UiProbe, mode: ExtensionContext["mode"] = "tui"): TestCo
 		isIdle: () => ctx.idle,
 		hasPendingMessages: () => ctx.pending,
 		getContextUsage: () => ctx.usage,
+		tools: [],
+		executeTool: async () => { throw new Error("Nested tool execution is not expected in watch-loop tests"); },
 		ui: {
 			setStatus(_key: string, value: string | undefined) {
 				probe.statuses.push(value);
@@ -136,7 +139,7 @@ function harness(options: { disabled?: boolean; contextThreshold?: number | unde
 async function callTool(
 	pi: FakePi,
 	params: Record<string, unknown>,
-	ctx: ExtensionContext,
+	ctx: ExtensionToolContext,
 ): Promise<Awaited<ReturnType<ToolDefinition["execute"]>>> {
 	const tool = pi.tools.get("watch_loop");
 	assert.ok(tool);

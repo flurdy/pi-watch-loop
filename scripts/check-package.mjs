@@ -17,8 +17,8 @@ assert.deepEqual(packageJson.peerDependencies, {
 	"@earendil-works/pi-coding-agent": "*",
 	typebox: "*",
 });
-assert.equal(packageJson.devDependencies["@earendil-works/pi-ai"], "0.85.0");
-assert.equal(packageJson.devDependencies["@earendil-works/pi-coding-agent"], "0.85.0");
+assert.equal(packageJson.devDependencies["@earendil-works/pi-ai"], "0.99.1");
+assert.equal(packageJson.devDependencies["@earendil-works/pi-coding-agent"], "0.99.1");
 
 const report = JSON.parse(execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {
 	cwd: repositoryRoot,
