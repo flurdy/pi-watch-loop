@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Text, TruncatedText } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import {
 	WATCH_LOOP_PROTOCOL_VERSION,
@@ -333,10 +334,20 @@ export class WatchLoopController {
 	}
 }
 
-function toolResult(result: WatchOperationResult, state: WatchLoopState) {
+interface WatchToolDetails {
+	protocolVersion: number;
+	state: WatchLoopState;
+	result?: WatchOperationResult;
+	summary?: string;
+}
+
+function toolResult(result: WatchOperationResult, state: WatchLoopState, now: number) {
+	const summary = state.status === "armed" && state.watch
+		? `watch · ${state.watch.label.replace(/\s+/g, " ")} · next ${formatDuration((state.nextRunAt ?? now) - now)} · tick ${state.tickCount}`
+		: undefined;
 	return {
-		content: [{ type: "text" as const, text: `${result.message}\n\n${formatWatchStatus(state)}` }],
-		details: { protocolVersion: WATCH_LOOP_PROTOCOL_VERSION, result, state },
+		content: [{ type: "text" as const, text: `${result.message}\n\n${formatWatchStatus(state, now)}` }],
+		details: { protocolVersion: WATCH_LOOP_PROTOCOL_VERSION, result, state, summary },
 		terminate: true,
 	};
 }
@@ -359,7 +370,7 @@ export function registerWatchLoopExtension(
 ): WatchLoopController {
 	const controller = new WatchLoopController(pi, dependencies);
 
-	pi.registerTool({
+	pi.registerTool<typeof watchLoopParameters, WatchToolDetails>({
 		name: "watch_loop",
 		label: "Watch Loop",
 		description:
@@ -372,6 +383,18 @@ export function registerWatchLoopExtension(
 		],
 		parameters: watchLoopParameters,
 		executionMode: "sequential",
+		renderCall(args, theme, ctx) {
+			if (ctx.expanded) return new Text(theme.fg("dim", `watch_loop ${JSON.stringify(args)}`), 0, 0);
+			return new Text(args.action === "complete" ? "" : theme.fg("muted", `watch · ${args.action ?? "…"}`), 0, 0);
+		},
+		renderResult(result, { expanded, isPartial }, theme, ctx) {
+			const details = result.details;
+			if (!expanded && !isPartial && !ctx.isError && details?.summary && details.result?.ok && !details.result.clamped?.length) {
+				return new TruncatedText(theme.fg("muted", details.summary));
+			}
+			const text = result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+			return new Text(theme.fg(ctx.isError || details?.result?.ok === false ? "error" : "toolOutput", text), 0, 0);
+		},
 		async execute(_toolCallId, params: WatchLoopParameters, _signal, _onUpdate, ctx) {
 			controller.bind(ctx);
 			if (params.action === "status") return statusResult(controller.state);
@@ -446,7 +469,7 @@ export function registerWatchLoopExtension(
 
 			throwIfRejected(transition, previousState);
 			if (!transition.result) throw new Error("watch_loop action produced no result");
-			return toolResult(transition.result, transition.state);
+			return toolResult(transition.result, transition.state, dependencies.now());
 		},
 	});
 

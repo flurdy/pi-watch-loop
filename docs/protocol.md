@@ -76,6 +76,13 @@ Deadline evaluation wins over overdue dispatch. Deadline and tick budget are che
 - `/watch-stop` — stop locally and invalidate a running generation.
 - `/watch-resume` — resume a paused watcher with one immediate generation.
 
+Routine successful tool completions render one compact line in the TUI, for example
+`watch · PR feedback · next 30m · tick 5`. The delay is a snapshot of the schedule at completion,
+not a live countdown. Long labels truncate to fit narrow panes. Expand with Ctrl+O for the full
+arguments and result; `/watch-status` still reports full current status. Errors, paused/stopped
+states, and delay-clamping notices remain detailed even when collapsed. Model-facing text and
+protocol tokens are unchanged; older results without summary metadata retain their full display.
+
 TUI mode also shows a compact footer status such as `watch: PRs · 2m`, `watch: PRs · running`, or `watch: PRs · paused`.
 
 Set `PI_WATCH_LOOP_DISABLED=1` before starting Pi to refuse new watches while preserving status and stop access.
@@ -146,7 +153,7 @@ npm run check
 npm run verify:git-install
 ```
 
-`check` runs the 42 protocol/adapter tests, typechecking against the pinned development Pi version,
+`check` runs the protocol, adapter, and rendering tests, typechecking against the pinned development Pi version,
 and the exact npm-package allowlist. `verify:git-install` requires a clean committed tree and installs
 that immutable commit through an isolated localhost Git server and Pi agent directory; it proves one
 copy of each extension command loads and `/watch-status` reports protocol 1 idle state.

@@ -7,7 +7,9 @@ import type {
 	ExtensionToolContext,
 	RegisteredCommand,
 	ToolDefinition,
+	Theme,
 } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import {
 	formatWatchStatus,
 	parseContextAdviceThreshold,
@@ -160,6 +162,95 @@ function startParams(overrides: Record<string, unknown> = {}): Record<string, un
 		...overrides,
 	};
 }
+
+const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as Theme;
+
+function renderTool(
+	pi: FakePi,
+	result: Awaited<ReturnType<ToolDefinition["execute"]>>,
+	args: Record<string, unknown>,
+	options: { expanded?: boolean; isError?: boolean; width?: number } = {},
+): string[] {
+	const tool = pi.tools.get("watch_loop");
+	assert.ok(tool?.renderCall, "watch calls need a compact renderer");
+	assert.ok(tool.renderResult, "watch results need a compact renderer");
+	const ctx = { args, expanded: false, isPartial: false, isError: false, ...options } as Parameters<NonNullable<ToolDefinition["renderCall"]>>[2];
+	return [
+		...tool.renderCall(args, plainTheme, ctx).render(options.width ?? 100),
+		...tool.renderResult(result, ctx, plainTheme, ctx).render(options.width ?? 100),
+	].map((line) => line.trimEnd()).filter(Boolean);
+}
+
+async function completedWatch(overrides: Record<string, unknown> = {}, completion: Record<string, unknown> = {}) {
+	const h = harness();
+	const ctx = context(h.probe);
+	await callTool(h.pi, startParams({ mode: "adaptive", intervalSeconds: undefined, ...overrides }), ctx);
+	h.setNow(NOW + 60_000);
+	h.timers.fire(0);
+	const args = {
+		action: "complete", protocolVersion: 1, watchId: "watch-1", generation: 1,
+		outcome: "continue", delaySeconds: 1800, ...completion,
+	};
+	const result = await callTool(h.pi, args, ctx);
+	return { ...h, args, result, ctx };
+}
+
+test("routine completion renders one stable line while retaining the full protocol result", async () => {
+	const { pi, result, args, setNow } = await completedWatch();
+	assert.deepEqual(renderTool(pi, result, args), ["watch · PRs · next 30m · tick 1"]);
+	setNow(NOW + 9_000_000);
+	assert.deepEqual(renderTool(pi, result, args), ["watch · PRs · next 30m · tick 1"]);
+	assert.equal(result.terminate, true);
+	assert.match(result.content[0]?.type === "text" ? result.content[0].text : "", /Protocol: 1/);
+	assert.match(renderTool(pi, result, args, { expanded: true }).join("\n"), /Watch: PRs \(watch-1\)/);
+	assert.match(renderTool(pi, result, args, { expanded: true }).join("\n"), /Consecutive misses: 0/);
+});
+
+test("fixed cadence and clamped adaptive delays render the actual scheduled interval", async () => {
+	const fixed = await completedWatch({ mode: "fixed", intervalSeconds: 120 });
+	assert.deepEqual(renderTool(fixed.pi, fixed.result, fixed.args), ["watch · PRs · next 2m · tick 1"]);
+	const clamped = await completedWatch({}, { delaySeconds: 1 });
+	const lines = renderTool(clamped.pi, clamped.result, clamped.args);
+	assert.match(lines.join("\n"), /clamp/i, "clamping must not be silently hidden");
+});
+
+test("collapsed errors, paused watches, and stopped watches retain their reasons", async () => {
+	const paused = await completedWatch({ missedCompletionPolicy: "pause" }, { delaySeconds: undefined });
+	assert.match(renderTool(paused.pi, paused.result, paused.args).join("\n"), /State: paused/);
+	assert.match(renderTool(paused.pi, paused.result, paused.args).join("\n"), /adaptive delay missing/);
+	const stopped = await completedWatch({}, { outcome: "stop", reason: "deployment failed" });
+	assert.match(renderTool(stopped.pi, stopped.result, stopped.args).join("\n"), /stopped/);
+	assert.match(renderTool(stopped.pi, stopped.result, stopped.args).join("\n"), /deployment failed/);
+	const failure = { content: [{ type: "text" as const, text: "stale generation rejected" }], details: undefined };
+	assert.match(renderTool(stopped.pi, failure, stopped.args, { isError: true }).join("\n"), /stale generation rejected/);
+});
+
+test("explicit status and historical results without rendering metadata remain readable", async () => {
+	const { pi, probe } = harness();
+	const args = { action: "status" };
+	const result = await callTool(pi, args, context(probe));
+	assert.match(renderTool(pi, result, args).join("\n"), /Protocol: 1\nState: idle/);
+	const historical = { content: [{ type: "text" as const, text: "Protocol: 1\nState: armed" }], details: undefined };
+	assert.match(renderTool(pi, historical, { action: "complete" }).join("\n"), /State: armed/);
+});
+
+test("compact output stays on one line for narrow panes and multiline wide-character labels", async () => {
+	const h = await completedWatch({ label: "PR feedback\n界界界界界界界界界界" });
+	for (const width of [20, 40, 80]) {
+		const lines = renderTool(h.pi, h.result, h.args, { width });
+		assert.equal(lines.length, 1);
+		assert.ok(visibleWidth(lines[0] ?? "") <= width);
+		assert.doesNotMatch(lines[0] ?? "", /watch-1|protocolVersion|generation/);
+	}
+});
+
+test("start renders a short action and schedule without exposing prompt or protocol arguments", async () => {
+	const { pi, probe } = harness();
+	const args = startParams();
+	const result = await callTool(pi, args, context(probe));
+	assert.deepEqual(renderTool(pi, result, args), ["watch · start", "watch · PRs · next 1m · tick 0"]);
+	assert.match(renderTool(pi, result, args, { expanded: true }).join("\n"), /tickPrompt/);
+});
 
 test("registers one sequential tool, three commands, and lifecycle handlers without arming a timer", async () => {
 	const { pi, timers, probe } = harness();

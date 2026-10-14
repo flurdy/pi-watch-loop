@@ -15,10 +15,12 @@ assert.equal(packageJson.repository?.url, "git+https://github.com/flurdy/pi-watc
 assert.deepEqual(packageJson.peerDependencies, {
 	"@earendil-works/pi-ai": "*",
 	"@earendil-works/pi-coding-agent": "*",
+	"@earendil-works/pi-tui": "*",
 	typebox: "*",
 });
 assert.equal(packageJson.devDependencies["@earendil-works/pi-ai"], "0.99.1");
 assert.equal(packageJson.devDependencies["@earendil-works/pi-coding-agent"], "0.99.1");
+assert.equal(packageJson.devDependencies["@earendil-works/pi-tui"], "0.99.1");
 
 const report = JSON.parse(execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {
 	cwd: repositoryRoot,
