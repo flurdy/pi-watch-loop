@@ -164,6 +164,7 @@ function startParams(overrides: Record<string, unknown> = {}): Record<string, un
 }
 
 const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as Theme;
+const COMPLETED_AT = new Date(NOW + 60_000).toTimeString().slice(0, 5);
 
 function renderTool(
 	pi: FakePi,
@@ -197,18 +198,32 @@ async function completedWatch(overrides: Record<string, unknown> = {}, completio
 
 test("routine completion renders one stable line while retaining the full protocol result", async () => {
 	const { pi, result, args, setNow } = await completedWatch();
-	assert.deepEqual(renderTool(pi, result, args), ["watch · PRs · next 30m · tick 1"]);
+	assert.deepEqual(renderTool(pi, result, args), [`watch · PRs · ${COMPLETED_AT} · next 30m · tick 1`]);
 	setNow(NOW + 9_000_000);
-	assert.deepEqual(renderTool(pi, result, args), ["watch · PRs · next 30m · tick 1"]);
+	assert.deepEqual(renderTool(pi, result, args), [`watch · PRs · ${COMPLETED_AT} · next 30m · tick 1`]);
 	assert.equal(result.terminate, true);
 	assert.match(result.content[0]?.type === "text" ? result.content[0].text : "", /Protocol: 1/);
 	assert.match(renderTool(pi, result, args, { expanded: true }).join("\n"), /Watch: PRs \(watch-1\)/);
 	assert.match(renderTool(pi, result, args, { expanded: true }).join("\n"), /Consecutive misses: 0/);
 });
 
+test("completion timestamps use local 24-hour time and retain zero padding across midnight", async () => {
+	const previousTimezone = process.env.TZ;
+	try {
+		for (const [timezone, expected] of [["UTC", "12:01"], ["Pacific/Auckland", "00:01"]]) {
+			process.env.TZ = timezone;
+			const h = await completedWatch();
+			assert.deepEqual(renderTool(h.pi, h.result, h.args), [`watch · PRs · ${expected} · next 30m · tick 1`]);
+		}
+	} finally {
+		if (previousTimezone === undefined) delete process.env.TZ;
+		else process.env.TZ = previousTimezone;
+	}
+});
+
 test("fixed cadence and clamped adaptive delays render the actual scheduled interval", async () => {
 	const fixed = await completedWatch({ mode: "fixed", intervalSeconds: 120 });
-	assert.deepEqual(renderTool(fixed.pi, fixed.result, fixed.args), ["watch · PRs · next 2m · tick 1"]);
+	assert.deepEqual(renderTool(fixed.pi, fixed.result, fixed.args), [`watch · PRs · ${COMPLETED_AT} · next 2m · tick 1`]);
 	const clamped = await completedWatch({}, { delaySeconds: 1 });
 	const lines = renderTool(clamped.pi, clamped.result, clamped.args);
 	assert.match(lines.join("\n"), /clamp/i, "clamping must not be silently hidden");
@@ -248,7 +263,7 @@ test("start renders a short action and schedule without exposing prompt or proto
 	const { pi, probe } = harness();
 	const args = startParams();
 	const result = await callTool(pi, args, context(probe));
-	assert.deepEqual(renderTool(pi, result, args), ["watch · start", "watch · PRs · next 1m · tick 0"]);
+	assert.deepEqual(renderTool(pi, result, args), ["watch · start", `watch · PRs · ${new Date(NOW).toTimeString().slice(0, 5)} · next 1m · tick 0`]);
 	assert.match(renderTool(pi, result, args, { expanded: true }).join("\n"), /tickPrompt/);
 });
 

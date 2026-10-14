@@ -77,8 +77,9 @@ Deadline evaluation wins over overdue dispatch. Deadline and tick budget are che
 - `/watch-resume` — resume a paused watcher with one immediate generation.
 
 Routine successful tool completions render one compact line in the TUI, for example
-`watch · PR feedback · next 30m · tick 5`. The delay is a snapshot of the schedule at completion,
-not a live countdown. Long labels truncate to fit narrow panes. Expand with Ctrl+O for the full
+`watch · PR feedback · 15:12 · next 30m · tick 5`. The timestamp is the result's local 24-hour
+creation time (completion time for tick results), captured once and retained in scrollback.
+The delay is a snapshot of the schedule at completion, not a live countdown. Long labels truncate to fit narrow panes. Expand with Ctrl+O for the full
 arguments and result; `/watch-status` still reports full current status. Errors, paused/stopped
 states, and delay-clamping notices remain detailed even when collapsed. Model-facing text and
 protocol tokens are unchanged; older results without summary metadata retain their full display.

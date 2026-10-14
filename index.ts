@@ -343,7 +343,7 @@ interface WatchToolDetails {
 
 function toolResult(result: WatchOperationResult, state: WatchLoopState, now: number) {
 	const summary = state.status === "armed" && state.watch
-		? `watch · ${state.watch.label.replace(/\s+/g, " ")} · next ${formatDuration((state.nextRunAt ?? now) - now)} · tick ${state.tickCount}`
+		? `watch · ${state.watch.label.replace(/\s+/g, " ")} · ${new Date(now).toTimeString().slice(0, 5)} · next ${formatDuration((state.nextRunAt ?? now) - now)} · tick ${state.tickCount}`
 		: undefined;
 	return {
 		content: [{ type: "text" as const, text: `${result.message}\n\n${formatWatchStatus(state, now)}` }],
