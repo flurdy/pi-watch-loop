@@ -415,6 +415,49 @@ test("user stop invalidates a running generation and rejects its late completion
 	assert.equal(timers.active().length, 0);
 });
 
+test("model stop cancels armed and paused watches using the watch ID from status", async () => {
+	const { pi, timers, probe, controller, setNow } = harness();
+	const ctx = context(probe);
+	const tool = pi.tools.get("watch_loop");
+	assert.ok(tool?.promptGuidelines?.some((line) => /stop/.test(line) && /watchId/.test(line) && /running/.test(line)));
+	await callTool(pi, startParams(), ctx);
+	const status = await callTool(pi, { action: "status" }, ctx);
+	assert.match(status.content[0]?.type === "text" ? status.content[0].text : "", /Watch: PRs \(watch-1\)/);
+
+	const stopped = await callTool(pi, { action: "stop", protocolVersion: 1, watchId: "watch-1", reason: "user asked to stop" }, ctx);
+	assert.equal(stopped.terminate, true);
+	assert.equal(controller.state.status, "stopped");
+	assert.equal(timers.active().length, 0);
+	setNow(NOW + 60_000);
+	timers.fire(0);
+	assert.deepEqual(pi.messages, []);
+
+	await callTool(pi, startParams({ missedCompletionPolicy: "pause", stopAt: new Date(NOW + 3_600_000).toISOString() }), ctx);
+	setNow(NOW + 120_000);
+	timers.fire(timers.timers.findIndex((timer) => !timer.cleared && timer.delay === 60_000));
+	await pi.emit("agent_settled", ctx);
+	assert.equal(controller.state.status, "paused");
+	assert.equal(timers.active().length, 1, "paused watch keeps only its deadline timer");
+	await callTool(pi, { action: "stop", protocolVersion: 1, watchId: "watch-2" }, ctx);
+	assert.equal(controller.state.status, "stopped");
+	assert.equal(timers.active().length, 0);
+});
+
+test("model stop of a running tick still requires its generation", async () => {
+	const { pi, timers, probe, controller, setNow } = harness();
+	const ctx = context(probe);
+	await callTool(pi, startParams({ stopAt: new Date(NOW + 3_600_000).toISOString() }), ctx);
+	setNow(NOW + 60_000);
+	timers.fire(0);
+	await assert.rejects(callTool(pi, { action: "stop", protocolVersion: 1, watchId: "watch-1" }, ctx), /generation is required/);
+	await assert.rejects(callTool(pi, { action: "stop", protocolVersion: 1, watchId: "watch-0", generation: 1 }, ctx), /watch ID/);
+	assert.equal(controller.state.status, "running");
+	await callTool(pi, { action: "stop", protocolVersion: 1, watchId: "watch-1", generation: 1 }, ctx);
+	assert.equal(controller.state.status, "stopped");
+	assert.equal(timers.active().length, 0);
+	await assert.rejects(callTool(pi, { action: "stop", protocolVersion: 1, watchId: "watch-1" }, ctx), /no active watch/);
+});
+
 test("adaptive completion without a delay applies the pause policy and terminates safely", async () => {
 	const { pi, timers, probe, controller, setNow } = harness();
 	const ctx = context(probe);

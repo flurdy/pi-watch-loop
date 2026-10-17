@@ -291,6 +291,85 @@ test("requires matching tokens for model stop while user stop invalidates a runn
 	assert.equal(lateCompletion.state, userStopped.state);
 });
 
+function pausedAfterMiss(): WatchLoopState {
+	return reduceWatchLoop(dispatch(start({ missedCompletionPolicy: "pause" })), {
+		type: "agent_settled",
+		now: NOW + 70_000,
+		canDispatch: true,
+	}).state;
+}
+
+const modelStop = { type: "stop" as const, protocolVersion: 1, watchId: "watch-1", reason: "user asked to stop" };
+
+test("model stop cancels armed and paused watches by watch ID without a generation", () => {
+	const armed = start();
+	for (const generation of [undefined, 0, 20, 21]) {
+		const stopped = reduceWatchLoop(armed, { ...modelStop, generation, now: NOW + 30_000 });
+		assert.equal(stopped.result?.code, "stopped");
+		assert.equal(stopped.state.status, "stopped");
+		assert.equal(stopped.state.lastReason, "user asked to stop");
+		assert.ok(effect(stopped.effects, "clear_timer"));
+		assert.deepEqual(reduceWatchLoop(stopped.state, { type: "timer_due", now: NOW + 60_000, canDispatch: true }).effects, []);
+	}
+
+	const busy = reduceWatchLoop(armed, { type: "timer_due", now: NOW + 60_000, canDispatch: false }).state;
+	assert.equal(busy.due, true);
+	const dueStopped = reduceWatchLoop(busy, { ...modelStop, now: NOW + 61_000 }).state;
+	assert.equal(dueStopped.due, false);
+	assert.deepEqual(reduceWatchLoop(dueStopped, { type: "agent_settled", now: NOW + 62_000, canDispatch: true }).effects, []);
+
+	const rearmed = reduceWatchLoop(dispatch(armed), {
+		type: "complete", protocolVersion: 1, watchId: "watch-1", generation: 1, outcome: "continue", now: NOW + 61_000,
+	}).state;
+	assert.equal(rearmed.status, "armed");
+	assert.equal(reduceWatchLoop(rearmed, { ...modelStop, now: NOW + 62_000 }).state.status, "stopped");
+
+	const paused = pausedAfterMiss();
+	assert.equal(paused.status, "paused");
+	const pausedStop = reduceWatchLoop(paused, { ...modelStop, now: NOW + 71_000 });
+	assert.equal(pausedStop.state.status, "stopped");
+	assert.ok(effect(pausedStop.effects, "clear_timer"));
+
+	const resumed = reduceWatchLoop(paused, { type: "resume", now: NOW + 72_000 }).state;
+	assert.equal(resumed.status, "armed");
+	assert.equal(resumed.reservedGeneration, 2);
+	const resumedStop = reduceWatchLoop(resumed, { ...modelStop, generation: 1, now: NOW + 72_500 }).state;
+	assert.equal(resumedStop.status, "stopped");
+	assert.equal(resumedStop.reservedGeneration, undefined);
+});
+
+test("model stop keeps watch identity and running-tick generation checks", () => {
+	const running = dispatch(start());
+	for (const state of [start(), running, pausedAfterMiss()]) {
+		for (const [event, code] of [
+			[{ watchId: "watch-0" }, "watch_id_mismatch"],
+			[{ protocolVersion: 2 }, "protocol_mismatch"],
+		] as const) {
+			const rejected = reduceWatchLoop(state, { ...modelStop, generation: state.generation, ...event, now: NOW + 61_000 });
+			assert.equal(rejected.result?.code, code);
+			assert.equal(rejected.state, state);
+		}
+	}
+
+	for (const [generation, code] of [[undefined, "generation_required"], [0, "generation_mismatch"], [2, "generation_mismatch"]] as const) {
+		const rejected = reduceWatchLoop(running, { ...modelStop, generation, now: NOW + 61_000 });
+		assert.equal(rejected.result?.code, code);
+		assert.equal(rejected.state, running);
+	}
+	const stopped = reduceWatchLoop(running, { ...modelStop, generation: 1, now: NOW + 61_000 }).state;
+	assert.equal(stopped.status, "stopped");
+	const lateCompletion = reduceWatchLoop(stopped, {
+		type: "complete", protocolVersion: 1, watchId: "watch-1", generation: 1, outcome: "continue", now: NOW + 62_000,
+	});
+	assert.equal(lateCompletion.result?.code, "not_running");
+
+	for (const inactive of [createIdleState(), stopped]) {
+		const rejected = reduceWatchLoop(inactive, { ...modelStop, generation: 1, now: NOW + 63_000 });
+		assert.equal(rejected.result?.code, "no_active_watch");
+		assert.equal(rejected.state, inactive);
+	}
+});
+
 test("applies pause and bounded retry policies to missed completions", () => {
 	const paused = reduceWatchLoop(dispatch(start({ missedCompletionPolicy: "pause" })), {
 		type: "agent_settled",

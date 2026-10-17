@@ -11,7 +11,7 @@ The extension contains no workflow-specific logic. Watch skills supply the label
 - `status` — report protocol version and current state; does not terminate the turn.
 - `start` — arm one watcher; requires `protocolVersion: 1` and terminates the initiating turn.
 - `complete` — continue or stop the running generation; requires matching protocol version, watch ID, and generation, and terminates the tick.
-- `stop` — model-facing terminal stop with the same matching tokens.
+- `stop` — model-facing terminal stop of the active watcher. Requires `protocolVersion: 1` and its `watchId` from status or the tick prompt. `generation` is also required, and must match, only while a tick is running; armed and paused watchers have no in-flight tick, so it is ignored there. Stop terminates the turn. Idle or stopped state rejects with no active watch.
 
 Only one watcher may be `armed`, `running`, or `paused`. A stopped watcher may be replaced by a new start.
 

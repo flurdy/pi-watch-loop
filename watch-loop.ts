@@ -63,7 +63,8 @@ export type WatchEvent =
 			type: "stop";
 			protocolVersion: number;
 			watchId: string;
-			generation: number;
+			/** Identifies a running tick; armed and paused watches are identified by watchId alone. */
+			generation?: number;
 			reason?: string;
 			now: number;
 	  }
@@ -313,6 +314,29 @@ function validateRunningToken(
 	return undefined;
 }
 
+function validateStopToken(
+	state: WatchLoopState,
+	protocolVersion: number,
+	watchId: string,
+	generation: number | undefined,
+): WatchTransition | undefined {
+	if (protocolVersion !== WATCH_LOOP_PROTOCOL_VERSION) {
+		return invalid(state, "protocol_mismatch", `watch_loop protocol ${WATCH_LOOP_PROTOCOL_VERSION} required`);
+	}
+	if (!state.watch || !["armed", "running", "paused"].includes(state.status)) {
+		return invalid(state, "no_active_watch", "no active watch to stop");
+	}
+	if (watchId !== state.watch.id) return invalid(state, "watch_id_mismatch", "watch ID does not match the active watch");
+	if (state.status !== "running") return undefined;
+	if (generation === undefined) {
+		return invalid(state, "generation_required", "generation is required while a watch tick is running");
+	}
+	if (generation !== state.generation) {
+		return invalid(state, "generation_mismatch", "generation does not match the running tick");
+	}
+	return undefined;
+}
+
 function startTransition(state: WatchLoopState, event: Extract<WatchEvent, { type: "start" }>): WatchTransition {
 	if (event.protocolVersion !== WATCH_LOOP_PROTOCOL_VERSION) {
 		return invalid(state, "protocol_mismatch", `watch_loop protocol ${WATCH_LOOP_PROTOCOL_VERSION} required`);
@@ -450,7 +474,7 @@ export function reduceWatchLoop(state: WatchLoopState, event: WatchEvent): Watch
 			);
 		}
 		case "stop": {
-			const invalidToken = validateRunningToken(
+			const invalidToken = validateStopToken(
 				state,
 				event.protocolVersion,
 				event.watchId,
