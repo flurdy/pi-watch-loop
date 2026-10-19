@@ -218,6 +218,19 @@ started 7 seconds before the tick. The footer changed to `due` at expiry. Compac
 24 seconds later; the tick dispatched within one second, then completed. Both watches stopped at
 their tick budgets with zero misses. No duplicate dispatch was observed.
 
+**Auto-compaction smoke:** On 2026-10-19, Pi 1.3.0 loaded commit
+`cd39851143493d355aeb2e417276eb24fa684cd5` in an isolated offline TUI with a scripted provider as the
+only other extension, `PI_WATCH_LOOP_AUTO_COMPACT=1`, Pi's own automatic compaction off and
+`keepRecentTokens` 200. A fixed 60-second watch with a five-tick budget reported 75%, 75%, 30%, 80%
+and 20% usage. After the first tick, compaction started about one second after settlement. A
+65-second scripted summary made the next tick due; it dispatched once when compaction finished.
+The second tick stayed latched and showed advice, 30% re-armed it, and the fourth tick compacted
+again. Both summary requests carried the label, watch ID, schedule, next tick time, budget and last
+completion reason. The watch stopped at 5/5 ticks with zero misses and each generation dispatched
+once. An earlier run, whose fixture answered Pi's turn-prefix summary with a tool call, exercised
+the failure path: the warning appeared, the watch kept ticking, and the latch prevented another
+attempt until usage fell below 50%. Summary quality and model cost need a real-model soak.
+
 ## Installation and rollback
 
 See the repository [README](../README.md) for immutable Git and local-checkout installation. Roll back
