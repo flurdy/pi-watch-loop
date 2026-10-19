@@ -229,7 +229,22 @@ again. Both summary requests carried the label, watch ID, schedule, next tick ti
 completion reason. The watch stopped at 5/5 ticks with zero misses and each generation dispatched
 once. An earlier run, whose fixture answered Pi's turn-prefix summary with a tool call, exercised
 the failure path: the warning appeared, the watch kept ticking, and the latch prevented another
-attempt until usage fell below 50%. Summary quality and model cost need a real-model soak.
+attempt until usage fell below 50%.
+
+**Real-model soak:** On 2026-10-19, Pi 1.3.0 loaded commit `df0b9f3` with
+`openai-codex/gpt-6.1-sol` (subscription; Pi lists an 872K context window). An isolated TUI watch
+ran for its 100-minute stopAt bound with auto-compaction enabled at the minimum supported 21%
+threshold, fixed 60-second cadence, and 60-tick budget. Its synthetic dashboard emitted 200
+fictional observations per tick; no external checks or tool calls were part of the tick. At tick
+47/60, measured context reached 21% and host compaction completed. The generated summary preserved
+the exact unrelated pending Maple archive decision, watch ID, schedule, tick budget and current
+findings. The watch continued through tick 53, stopped at the deadline with zero consecutive misses,
+and recorded 53 tick prompts and 53 matching completion calls. No duplicate dispatch was observed.
+The default 70% trigger and lower-threshold re-arm were not exercised in this run; those remain
+covered by unit tests. Aggregate reported usage was 234,372 input, 4,271,872 cache-read, and 186,822
+output tokens. Pi estimated $2.76 nominal cost; the configured policy classified this subscription
+route as non-metered, so this is not billed-spend evidence. Raw session and TUI captures remain
+ignored under `.artifacts/real-model-soak-20261019/`.
 
 ## Installation and rollback
 
