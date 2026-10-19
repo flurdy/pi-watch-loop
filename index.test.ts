@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type {
+	CompactOptions,
 	ContextUsage,
 	ExtensionAPI,
 	ExtensionContext,
@@ -12,6 +13,7 @@ import type {
 import { visibleWidth } from "@earendil-works/pi-tui";
 import {
 	formatWatchStatus,
+	parseAutoCompactThreshold,
 	parseContextAdviceThreshold,
 	registerWatchLoopExtension,
 	type WatchLoopControllerDependencies,
@@ -89,7 +91,12 @@ interface UiProbe {
 	notifications: Array<{ message: string; level: string }>;
 }
 
-type TestContext = ExtensionToolContext & { idle: boolean; pending: boolean; usage: ContextUsage | undefined };
+type TestContext = ExtensionToolContext & {
+	idle: boolean;
+	pending: boolean;
+	usage: ContextUsage | undefined;
+	compactions: CompactOptions[];
+};
 
 function usage(percent: number | null): ContextUsage {
 	return { tokens: percent === null ? null : percent * 2_000, contextWindow: 200_000, percent };
@@ -103,6 +110,8 @@ function context(probe: UiProbe, mode: ExtensionContext["mode"] = "tui"): TestCo
 		idle: true,
 		pending: false,
 		usage: undefined,
+		compactions: [],
+		compact: (options?: CompactOptions) => ctx.compactions.push(options ?? {}),
 		isIdle: () => ctx.idle,
 		hasPendingMessages: () => ctx.pending,
 		getContextUsage: () => ctx.usage,
@@ -120,7 +129,7 @@ function context(probe: UiProbe, mode: ExtensionContext["mode"] = "tui"): TestCo
 	return ctx;
 }
 
-function harness(options: { disabled?: boolean; contextThreshold?: number | undefined } = {}) {
+function harness(options: { disabled?: boolean; contextThreshold?: number | undefined; autoCompact?: number } = {}) {
 	const pi = new FakePi();
 	const timers = new FakeTimers();
 	const probe: UiProbe = { statuses: [], notifications: [] };
@@ -133,6 +142,7 @@ function harness(options: { disabled?: boolean; contextThreshold?: number | unde
 		createWatchId: () => `watch-${++watchCount}`,
 		isDisabled: () => options.disabled === true,
 		contextAdviceThreshold: () => ("contextThreshold" in options ? options.contextThreshold : 50),
+		autoCompactThreshold: () => options.autoCompact,
 	};
 	const controller = registerWatchLoopExtension(pi as unknown as ExtensionAPI, dependencies);
 	return { pi, timers, probe, controller, setNow: (value: number) => (now = value) };
@@ -533,9 +543,9 @@ function contextNotices(probe: UiProbe): string[] {
 	return probe.notifications.map((notice) => notice.message).filter((message) => /context/i.test(message));
 }
 
-test("parses the context advice threshold strictly and falls back to 50", () => {
+test("parses the context advice threshold strictly and falls back to 40", () => {
 	for (const value of [undefined, "", "  ", "50junk", "1.5", "100", "-1", "5e1", "０５"]) {
-		assert.equal(parseContextAdviceThreshold(value), 50, String(value));
+		assert.equal(parseContextAdviceThreshold(value), 40, String(value));
 	}
 	for (const value of ["0", "off", " OFF "]) assert.equal(parseContextAdviceThreshold(value), undefined, value);
 	assert.equal(parseContextAdviceThreshold("1"), 1);
@@ -729,4 +739,308 @@ test("compaction leaves scheduled, paused, and auto-compacted watches untouched"
 	assert.equal(controller.state.status, "paused");
 	assert.equal(timers.active().length, 0);
 	assert.equal(pi.messages.length, 1);
+});
+
+const AUTO_START_DELAY = 1_000;
+
+function lastNotice(probe: UiProbe): { message: string; level: string } {
+	return probe.notifications.at(-1) ?? { message: "", level: "" };
+}
+
+function pendingStarts(timers: FakeTimers): number[] {
+	return timers.timers.flatMap((timer, index) => (!timer.cleared && timer.delay === AUTO_START_DELAY ? [index] : []));
+}
+
+async function settleWithUsage(pi: FakePi, ctx: TestContext, percent: number | null): Promise<void> {
+	ctx.usage = usage(percent);
+	await pi.emit("agent_settled", ctx);
+}
+
+function fireStarts(timers: FakeTimers): void {
+	for (const index of pendingStarts(timers)) timers.fire(index);
+}
+
+test("parses the auto-compaction opt-in and threshold strictly; it stays off unless enabled", () => {
+	for (const enabled of [undefined, "", "0", "true", "yes", "on", "2"]) {
+		assert.equal(parseAutoCompactThreshold(enabled, "80"), undefined, String(enabled));
+	}
+	assert.equal(parseAutoCompactThreshold("1", undefined), 70);
+	assert.equal(parseAutoCompactThreshold(" 1 ", " 80 "), 80);
+	for (const value of ["21", "99"]) assert.equal(parseAutoCompactThreshold("1", value), Number(value));
+	for (const value of ["", "20", "05", "100", "7", "70%", "6e1", "off"]) {
+		assert.equal(parseAutoCompactThreshold("1", value), 70, value);
+	}
+});
+
+test("auto-compaction is off by default, leaving advice only", async () => {
+	const { pi, timers, probe } = harness();
+	const ctx = context(probe);
+	await callTool(pi, startParams(), ctx);
+	await settleWithUsage(pi, ctx, 95);
+	assert.deepEqual(pendingStarts(timers), []);
+	assert.equal(ctx.compactions.length, 0);
+	assert.match(lastNotice(probe).message, /Consider \/compact/);
+});
+
+test("compacts an armed watch between ticks shortly after settlement, preserving session and watch state", async () => {
+	const { pi, timers, probe, controller, setNow } = harness({ autoCompact: 70 });
+	const ctx = context(probe);
+	await callTool(pi, startParams(), ctx);
+	setNow(NOW + 60_000);
+	timers.fire(0);
+	await callTool(
+		pi,
+		{ action: "complete", protocolVersion: 1, watchId: "watch-1", generation: 1, outcome: "continue", reason: "2 PRs await review" },
+		ctx,
+	);
+	const notices = probe.notifications.length;
+	await settleWithUsage(pi, ctx, 72);
+	assert.equal(ctx.compactions.length, 0, "never inside the agent_settled handler");
+	assert.equal(probe.notifications.length, notices, "advice yields to the pending compaction");
+	assert.equal(pendingStarts(timers).length, 1);
+
+	fireStarts(timers);
+	assert.equal(ctx.compactions.length, 1);
+	assert.equal(controller.state.status, "armed");
+	assert.match(lastNotice(probe).message, /Watch "PRs": context 72% reached auto-compaction at 70%\. Compacting between ticks/);
+	const instructions = ctx.compactions[0]?.customInstructions ?? "";
+	assert.match(instructions, /unrelated to the watch/);
+	assert.match(instructions, /Label "PRs", watch ID watch-1/);
+	assert.match(instructions, /fixed, every 120s from completion/);
+	assert.match(instructions, new RegExp(`next tick at ${new Date(NOW + 180_000).toISOString()}`));
+	assert.match(instructions, /ticks 1 of 5/);
+	assert.match(instructions, /Last outcome: continue \(2 PRs await review\)/);
+
+	ctx.compactions[0]?.onComplete?.({} as never);
+	assert.deepEqual(lastNotice(probe), {
+		message: 'Watch "PRs": auto-compaction finished; the watch keeps its schedule.',
+		level: "info",
+	});
+	assert.equal(pi.messages.length, 1);
+	assert.equal(timers.active()[0]?.delay, 120_000);
+});
+
+test("auto-compaction never interrupts a tick and waits for an idle, armed watch", async () => {
+	const { pi, timers, probe, controller, setNow } = harness({ autoCompact: 70 });
+	const ctx = context(probe);
+	await callTool(pi, startParams({ missedCompletionPolicy: "pause" }), ctx);
+
+	ctx.idle = false;
+	await settleWithUsage(pi, ctx, 80);
+	ctx.idle = true;
+	ctx.pending = true;
+	await settleWithUsage(pi, ctx, 80);
+	ctx.pending = false;
+	assert.deepEqual(pendingStarts(timers), [], "busy or queued sessions are skipped");
+
+	await settleWithUsage(pi, ctx, 80);
+	ctx.idle = false;
+	fireStarts(timers);
+	assert.equal(ctx.compactions.length, 0, "a run started during the delay wins");
+	ctx.idle = true;
+
+	await settleWithUsage(pi, ctx, 80);
+	setNow(NOW + 60_000);
+	timers.fire(0);
+	assert.equal(controller.state.status, "running");
+	fireStarts(timers);
+	assert.equal(ctx.compactions.length, 0, "a running tick is never compacted");
+
+	await settleWithUsage(pi, ctx, 80);
+	assert.equal(controller.state.status, "paused");
+	assert.deepEqual(pendingStarts(timers), [], "paused watches get advice only");
+	assert.equal(ctx.compactions.length, 0);
+});
+
+test("a settlement that dispatches a due tick schedules no compaction", async () => {
+	const { pi, timers, probe, controller, setNow } = harness({ autoCompact: 70 });
+	const ctx = context(probe);
+	await callTool(pi, startParams(), ctx);
+	ctx.idle = false;
+	setNow(NOW + 60_000);
+	timers.fire(0);
+	assert.equal(controller.state.due, true);
+	ctx.idle = true;
+	await settleWithUsage(pi, ctx, 80);
+	assert.equal(controller.state.status, "running");
+	assert.deepEqual(pendingStarts(timers), []);
+});
+
+test("attempts once per crossing and re-arms only below the reset threshold", async () => {
+	const { pi, timers, probe } = harness({ autoCompact: 70 });
+	const ctx = context(probe);
+	await callTool(pi, startParams({ maxTicks: undefined, allowIndefinite: true }), ctx);
+	const settleAndStart = async (percent: number | null) => {
+		await settleWithUsage(pi, ctx, percent);
+		fireStarts(timers);
+	};
+
+	await settleAndStart(72);
+	await settleAndStart(75);
+	assert.equal(ctx.compactions.length, 1, "no second attempt while one is in flight");
+	ctx.compactions[0]?.onComplete?.({} as never);
+	for (const percent of [null, 60, 75, 50]) await settleAndStart(percent);
+	assert.equal(ctx.compactions.length, 1, "unknown or reset-level readings keep the latch");
+	await settleAndStart(49);
+	await settleAndStart(71);
+	assert.equal(ctx.compactions.length, 2);
+	ctx.compactions[1]?.onComplete?.({} as never);
+
+	const stop = pi.commands.get("watch-stop");
+	assert.ok(stop);
+	await stop.handler("", ctx as never);
+	await callTool(pi, startParams(), ctx);
+	await settleAndStart(72);
+	assert.equal(ctx.compactions.length, 3, "a new watch starts unlatched");
+});
+
+test("a failed compaction warns once, keeps the watch ticking and is not retried while context stays high", async () => {
+	const { pi, timers, probe, controller, setNow } = harness({ autoCompact: 70 });
+	const ctx = context(probe);
+	await callTool(pi, startParams(), ctx);
+	await settleWithUsage(pi, ctx, 85);
+	fireStarts(timers);
+	ctx.compactions[0]?.onError?.(new Error("Compaction failed: provider overloaded"));
+	assert.equal(lastNotice(probe).level, "warning");
+	assert.match(
+		lastNotice(probe).message,
+		/auto-compaction failed: Compaction failed: provider overloaded\. The watch continues; auto-compaction waits until context falls below 50%\. Use \/compact to retry now\./,
+	);
+
+	for (let settle = 0; settle < 3; settle += 1) {
+		await settleWithUsage(pi, ctx, 90);
+		fireStarts(timers);
+	}
+	assert.equal(ctx.compactions.length, 1);
+	assert.equal(controller.state.status, "armed");
+	setNow(NOW + 60_000);
+	timers.fire(0);
+	assert.equal(pi.messages.length, 1, "the watch keeps ticking");
+});
+
+test("a tick that falls due during auto-compaction dispatches once it ends", async () => {
+	const { pi, timers, probe, controller, setNow } = harness({ autoCompact: 70 });
+	const ctx = context(probe);
+	await callTool(pi, startParams(), ctx);
+	await settleWithUsage(pi, ctx, 80);
+	fireStarts(timers);
+	ctx.idle = false;
+	setNow(NOW + 60_000);
+	timers.fire(0);
+	assert.equal(controller.state.due, true);
+
+	ctx.idle = true;
+	ctx.compactions[0]?.onComplete?.({} as never);
+	const recheck = timers.timers.length - 1;
+	assert.equal(timers.timers[recheck]?.delay, 1_000);
+	timers.fire(recheck);
+	assert.equal(controller.state.status, "running");
+	assert.equal(pi.messages.length, 1);
+});
+
+test("session end cancels a pending start and silences callbacks from the old session", async () => {
+	const { pi, timers, probe } = harness({ autoCompact: 70 });
+	const ctx = context(probe);
+	await callTool(pi, startParams(), ctx);
+	await settleWithUsage(pi, ctx, 80);
+	const start = pendingStarts(timers)[0] ?? -1;
+	await pi.emit("session_shutdown", ctx);
+	timers.fire(start);
+	assert.equal(ctx.compactions.length, 0);
+
+	await pi.emit("session_start", ctx);
+	await callTool(pi, startParams(), ctx);
+	await settleWithUsage(pi, ctx, 80);
+	fireStarts(timers);
+	assert.equal(ctx.compactions.length, 1);
+	await pi.emit("session_shutdown", ctx);
+	const next = context(probe);
+	await pi.emit("session_start", next);
+	const notices = probe.notifications.length;
+	const timerCount = timers.timers.length;
+	ctx.compactions[0]?.onComplete?.({} as never);
+	ctx.compactions[0]?.onError?.(new Error("aborted"));
+	assert.equal(probe.notifications.length, notices);
+	assert.equal(timers.timers.length, timerCount);
+});
+
+test("a late callback from an earlier attempt cannot finish a newer one", async () => {
+	const { pi, timers, probe } = harness({ autoCompact: 70 });
+	const ctx = context(probe);
+	await callTool(pi, startParams({ maxTicks: undefined, allowIndefinite: true }), ctx);
+	await settleWithUsage(pi, ctx, 75);
+	fireStarts(timers);
+	ctx.compactions[0]?.onComplete?.({} as never);
+	await settleWithUsage(pi, ctx, 30);
+	await settleWithUsage(pi, ctx, 75);
+	fireStarts(timers);
+	assert.equal(ctx.compactions.length, 2);
+
+	const notices = probe.notifications.length;
+	ctx.compactions[0]?.onError?.(new Error("duplicate"));
+	assert.equal(probe.notifications.length, notices);
+	const status = pi.commands.get("watch-status");
+	assert.ok(status);
+	await status.handler("", ctx as never);
+	assert.match(lastNotice(probe).message, /\(compacting\)$/);
+	ctx.compactions[1]?.onComplete?.({} as never);
+	assert.match(lastNotice(probe).message, /auto-compaction finished/);
+});
+
+test("each settlement restarts the start delay, and a replaced watch's pending start never compacts", async () => {
+	const { pi, timers, probe } = harness({ autoCompact: 70 });
+	const ctx = context(probe);
+	await callTool(pi, startParams(), ctx);
+	await settleWithUsage(pi, ctx, 80);
+	const first = pendingStarts(timers);
+	await settleWithUsage(pi, ctx, 80);
+	const second = pendingStarts(timers);
+	assert.equal(second.length, 1);
+	assert.notDeepEqual(second, first, "a later settlement restarts the delay");
+
+	const stop = pi.commands.get("watch-stop");
+	assert.ok(stop);
+	await stop.handler("", ctx as never);
+	await callTool(pi, startParams(), ctx);
+	for (const index of second) timers.fire(index);
+	assert.equal(ctx.compactions.length, 0, "the stopped watch's start does not compact its replacement");
+
+	await settleWithUsage(pi, ctx, 80);
+	fireStarts(timers);
+	assert.equal(ctx.compactions.length, 1);
+	assert.match(ctx.compactions[0]?.customInstructions ?? "", /watch ID watch-2/);
+});
+
+test("advice returns when a deferred start finds Pi busy", async () => {
+	const { pi, timers, probe } = harness({ autoCompact: 70 });
+	const ctx = context(probe);
+	await callTool(pi, startParams(), ctx);
+	await settleWithUsage(pi, ctx, 80);
+	assert.deepEqual(contextNotices(probe), []);
+	ctx.idle = false;
+	fireStarts(timers);
+	assert.equal(ctx.compactions.length, 0);
+	assert.match(lastNotice(probe).message, /context 80% \(advice from 50%\)\. Consider \/compact/);
+});
+
+test("/watch-status reports auto-compaction settings and progress", async () => {
+	const statusOf = async (pi: FakePi, probe: UiProbe, ctx: TestContext) => {
+		const status = pi.commands.get("watch-status");
+		assert.ok(status);
+		await status.handler("", ctx as never);
+		return lastNotice(probe).message;
+	};
+	const off = harness();
+	assert.match(await statusOf(off.pi, off.probe, context(off.probe)), /Auto-compaction: off/);
+
+	const { pi, timers, probe } = harness({ autoCompact: 80 });
+	const ctx = context(probe);
+	assert.match(await statusOf(pi, probe, ctx), /Auto-compaction: from 80%, re-arms below 60%$/);
+	await callTool(pi, startParams(), ctx);
+	await settleWithUsage(pi, ctx, 85);
+	assert.match(await statusOf(pi, probe, ctx), /\(starting\)$/);
+	fireStarts(timers);
+	assert.match(await statusOf(pi, probe, ctx), /\(compacting\)$/);
+	ctx.compactions[0]?.onComplete?.({} as never);
+	assert.match(await statusOf(pi, probe, ctx), /\(waiting for context below 60%\)$/);
 });

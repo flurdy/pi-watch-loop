@@ -7,6 +7,7 @@ import {
 	WATCH_LOOP_PROTOCOL_VERSION,
 	createIdleState,
 	reduceWatchLoop,
+	type CompletionOutcome,
 	type WatchEvent,
 	type WatchLoopState,
 	type WatchOperationResult,
@@ -15,10 +16,15 @@ import {
 } from "./watch-loop.ts";
 
 const STATUS_KEY = "pi-watch-loop";
-const DEFAULT_CONTEXT_ADVICE_PERCENT = 50;
+const DEFAULT_CONTEXT_ADVICE_PERCENT = 40;
 const CONTEXT_ADVICE_BAND_PERCENT = 10;
 const COMPACTION_RECHECK_MILLISECONDS = 1_000;
 const COMPACTION_RECHECKS = 10;
+const DEFAULT_AUTO_COMPACT_PERCENT = 70;
+const AUTO_COMPACT_RESET_POINTS = 20;
+/** Lets prompts deferred during agent_settled start before compaction claims the idle session. */
+const AUTO_COMPACT_START_MILLISECONDS = 1_000;
+const MAX_INSTRUCTION_TEXT_LENGTH = 300;
 
 const watchLoopParameters = Type.Object({
 	action: StringEnum(["status", "start", "complete", "stop"] as const),
@@ -49,6 +55,8 @@ export interface WatchLoopControllerDependencies {
 	isDisabled: () => boolean;
 	/** Percent at which compaction advice starts, or undefined when advice is off. */
 	contextAdviceThreshold: () => number | undefined;
+	/** Percent at which an armed watch compacts automatically, or undefined when not opted in. */
+	autoCompactThreshold: () => number | undefined;
 }
 
 /** Unset or invalid values use the default; `0` or `off` disables advice. */
@@ -59,6 +67,14 @@ export function parseContextAdviceThreshold(value: string | undefined): number |
 	return Number(trimmed);
 }
 
+/** Off unless `enabled` is `1`; thresholds outside 21-99 use the default so the reset level stays positive. */
+export function parseAutoCompactThreshold(enabled: string | undefined, percent: string | undefined): number | undefined {
+	if (enabled?.trim() !== "1") return undefined;
+	const trimmed = percent?.trim() ?? "";
+	const value = /^[0-9]{2}$/.test(trimmed) ? Number(trimmed) : 0;
+	return value > AUTO_COMPACT_RESET_POINTS ? value : DEFAULT_AUTO_COMPACT_PERCENT;
+}
+
 const defaultDependencies: WatchLoopControllerDependencies = {
 	now: Date.now,
 	setTimer: (callback, delayMilliseconds) => setTimeout(callback, delayMilliseconds),
@@ -66,6 +82,8 @@ const defaultDependencies: WatchLoopControllerDependencies = {
 	createWatchId: randomUUID,
 	isDisabled: () => process.env.PI_WATCH_LOOP_DISABLED === "1",
 	contextAdviceThreshold: () => parseContextAdviceThreshold(process.env.PI_WATCH_LOOP_CONTEXT_PERCENT),
+	autoCompactThreshold: () =>
+		parseAutoCompactThreshold(process.env.PI_WATCH_LOOP_AUTO_COMPACT, process.env.PI_WATCH_LOOP_AUTO_COMPACT_PERCENT),
 };
 
 function requiredNumber(value: number | undefined, name: string): number {
@@ -87,6 +105,51 @@ function parseStopAt(value: string | undefined): number | undefined {
 
 function canDispatch(ctx: ExtensionContext): boolean {
 	return ctx.isIdle() && !ctx.hasPendingMessages();
+}
+
+function knownContextPercent(ctx: ExtensionContext): number | undefined {
+	const percent = ctx.getContextUsage()?.percent;
+	return typeof percent === "number" && Number.isFinite(percent) ? percent : undefined;
+}
+
+function bounded(text: string): string {
+	const singleLine = text.replace(/\s+/g, " ").trim();
+	return singleLine.length > MAX_INSTRUCTION_TEXT_LENGTH ? `${singleLine.slice(0, MAX_INSTRUCTION_TEXT_LENGTH)}…` : singleLine;
+}
+
+interface CompletionRecord {
+	watchId: string;
+	outcome: CompletionOutcome;
+	reason?: string;
+}
+
+/** Summary guidance for a watch-triggered compaction: keep the session, collapse repeated ticks. */
+export function autoCompactionInstructions(state: WatchLoopState, lastCompletion: CompletionRecord | undefined): string {
+	const watch = state.watch;
+	if (!watch) return "";
+	const schedule = [
+		watch.mode === "fixed" ? `fixed, every ${watch.intervalSeconds}s from completion` : "adaptive, 60-3600s chosen by each tick",
+		state.due ? "next tick due now" : state.nextRunAt === undefined ? undefined : `next tick at ${new Date(state.nextRunAt).toISOString()}`,
+	];
+	const budget = [
+		`ticks ${state.tickCount} of ${watch.maxTicks ?? "unbounded"}`,
+		watch.stopAt === undefined ? undefined : `deadline ${new Date(watch.stopAt).toISOString()}`,
+		watch.allowIndefinite && watch.stopAt === undefined && watch.maxTicks === undefined ? "explicitly indefinite" : undefined,
+	];
+	const completion = lastCompletion?.watchId === watch.id ? lastCompletion : undefined;
+	const outcome = completion
+		? `${completion.outcome}${completion.reason ? ` (${bounded(completion.reason)})` : ""}`
+		: bounded(state.lastReason ?? "none yet");
+	return [
+		"This session runs a pi-watch-loop watch whose repeated ticks fill much of the history.",
+		"Summarize the rest of the session as you normally would: keep the user's goals, ongoing work, decisions, open questions and any tasks unrelated to the watch, even where watch output dominates.",
+		"Collapse repeated watch tick prompts, dashboards and watch_loop calls into the watch's current state: its latest findings, notable changes across ticks and unresolved items. Earlier tick prompts and generation numbers need not be kept; each new tick prompt carries its own protocol tokens.",
+		"Keep these watch details:",
+		`- Label ${JSON.stringify(bounded(watch.label))}, watch ID ${watch.id}`,
+		`- Schedule: ${schedule.filter(Boolean).join("; ")}`,
+		`- Budget: ${budget.filter(Boolean).join("; ")}`,
+		`- Last outcome: ${outcome}`,
+	].join("\n");
 }
 
 function formatDuration(milliseconds: number): string {
@@ -154,6 +217,13 @@ export class WatchLoopController {
 	private deadlineTimerToken = 0;
 	private currentContext: ExtensionContext | undefined;
 	private contextAdvice: { watchId: string; band: number } | undefined;
+	private lastCompletion: CompletionRecord | undefined;
+	/** Identifies the current attempt; session end advances it so older callbacks are ignored. */
+	private autoCompactAttempt = 0;
+	private autoCompactLatch: { watchId: string; latched: boolean } | undefined;
+	private autoCompactStart: ReturnType<typeof setTimeout> | undefined;
+	private autoCompactStartToken = 0;
+	private autoCompactInFlight = false;
 
 	constructor(
 		private readonly pi: ExtensionAPI,
@@ -173,6 +243,9 @@ export class WatchLoopController {
 		this.currentContext = ctx;
 		const transition = reduceWatchLoop(this.currentState, event);
 		this.apply(transition, ctx);
+		if (event.type === "complete" && transition.result?.ok) {
+			this.lastCompletion = { watchId: event.watchId, outcome: event.outcome, reason: event.reason };
+		}
 		return transition;
 	}
 
@@ -188,6 +261,7 @@ export class WatchLoopController {
 				ctx,
 			);
 		}
+		if (this.considerAutoCompaction(ctx)) return;
 		this.adviseContext(ctx);
 	}
 
@@ -201,7 +275,112 @@ export class WatchLoopController {
 	}
 
 	formatContextStatus(ctx: ExtensionContext): string {
-		return formatContextStatus(ctx, this.dependencies.contextAdviceThreshold());
+		return [formatContextStatus(ctx, this.dependencies.contextAdviceThreshold()), this.formatAutoCompactionStatus()].join("\n");
+	}
+
+	private formatAutoCompactionStatus(): string {
+		const threshold = this.dependencies.autoCompactThreshold();
+		if (threshold === undefined) return "Auto-compaction: off";
+		const reset = threshold - AUTO_COMPACT_RESET_POINTS;
+		const latched = this.autoCompactLatch?.latched && this.autoCompactLatch.watchId === this.currentState.watch?.id;
+		const phase = this.autoCompactInFlight
+			? " (compacting)"
+			: this.autoCompactStart
+				? " (starting)"
+				: latched
+					? ` (waiting for context below ${reset}%)`
+					: "";
+		return `Auto-compaction: from ${threshold}%, re-arms below ${reset}%${phase}`;
+	}
+
+	/**
+	 * Tracks the per-watch latch and (re)starts the deferred start delay for an eligible armed watch.
+	 * Returns true while a start is pending or in flight, so advice does not repeat it.
+	 */
+	private considerAutoCompaction(ctx: ExtensionContext): boolean {
+		const threshold = this.dependencies.autoCompactThreshold();
+		const watch = this.currentState.watch;
+		if (threshold === undefined || !watch) return false;
+		if (this.autoCompactLatch?.watchId !== watch.id) this.autoCompactLatch = { watchId: watch.id, latched: false };
+		const percent = knownContextPercent(ctx);
+		if (percent !== undefined && percent < threshold - AUTO_COMPACT_RESET_POINTS) this.autoCompactLatch.latched = false;
+		if (this.autoCompactInFlight) return true;
+		this.cancelAutoCompactionStart();
+		if (!this.canAutoCompact(ctx, threshold)) return false;
+		const token = this.autoCompactStartToken;
+		const watchId = watch.id;
+		this.autoCompactStart = this.dependencies.setTimer(() => {
+			if (token !== this.autoCompactStartToken) return;
+			this.autoCompactStart = undefined;
+			const current = this.currentContext;
+			if (!this.startAutoCompaction(watchId) && current) this.adviseContext(current);
+		}, AUTO_COMPACT_START_MILLISECONDS);
+		return true;
+	}
+
+	private canAutoCompact(ctx: ExtensionContext, threshold: number): boolean {
+		const { status, due, watch } = this.currentState;
+		const percent = knownContextPercent(ctx);
+		return (
+			status === "armed" &&
+			!due &&
+			canDispatch(ctx) &&
+			this.autoCompactLatch?.watchId === watch?.id &&
+			!this.autoCompactLatch?.latched &&
+			percent !== undefined &&
+			percent >= threshold
+		);
+	}
+
+	/** Rechecks eligibility for the watch that scheduled the start; returns whether compaction began. */
+	private startAutoCompaction(watchId: string): boolean {
+		const ctx = this.currentContext;
+		const threshold = this.dependencies.autoCompactThreshold();
+		const watch = this.currentState.watch;
+		if (!ctx || threshold === undefined || watch?.id !== watchId || this.autoCompactInFlight || !this.canAutoCompact(ctx, threshold)) {
+			return false;
+		}
+		const percent = Math.floor(knownContextPercent(ctx) ?? threshold);
+		const reset = threshold - AUTO_COMPACT_RESET_POINTS;
+		const attempt = ++this.autoCompactAttempt;
+		const label = `Watch "${watch.label}"`;
+		this.autoCompactLatch = { watchId: watch.id, latched: true };
+		this.autoCompactInFlight = true;
+		const finish = (message: string, level: "info" | "warning") => {
+			if (attempt !== this.autoCompactAttempt || !this.autoCompactInFlight) return;
+			this.autoCompactInFlight = false;
+			const current = this.currentContext;
+			if (!current) return;
+			if (current.hasUI) current.ui.notify(message, level);
+			this.onManualCompactionEnded(current);
+		};
+		const failed = (error: unknown) =>
+			finish(
+				`${label}: auto-compaction failed: ${bounded(error instanceof Error ? error.message : String(error))}. The watch continues; auto-compaction waits until context falls below ${reset}%. Use /compact to retry now.`,
+				"warning",
+			);
+		if (ctx.hasUI) {
+			ctx.ui.notify(
+				`${label}: context ${percent}% reached auto-compaction at ${threshold}%. Compacting between ticks; the watch keeps its schedule.`,
+				"info",
+			);
+		}
+		try {
+			ctx.compact({
+				customInstructions: autoCompactionInstructions(this.currentState, this.lastCompletion),
+				onComplete: () => finish(`${label}: auto-compaction finished; the watch keeps its schedule.`, "info"),
+				onError: failed,
+			});
+		} catch (error) {
+			failed(error);
+		}
+		return true;
+	}
+
+	private cancelAutoCompactionStart(): void {
+		this.autoCompactStartToken += 1;
+		if (this.autoCompactStart) this.dependencies.clearTimer(this.autoCompactStart);
+		this.autoCompactStart = undefined;
 	}
 
 	private isDue(): boolean {
@@ -212,8 +391,8 @@ export class WatchLoopController {
 		const { status, watch } = this.currentState;
 		const threshold = this.dependencies.contextAdviceThreshold();
 		if (threshold === undefined || !watch || !["armed", "running", "paused"].includes(status)) return;
-		const percent = ctx.getContextUsage()?.percent;
-		if (typeof percent !== "number" || !Number.isFinite(percent)) return;
+		const percent = knownContextPercent(ctx);
+		if (percent === undefined) return;
 
 		const band = percent >= threshold ? Math.floor((percent - threshold) / CONTEXT_ADVICE_BAND_PERCENT) : -1;
 		const advisedBand = this.contextAdvice?.watchId === watch.id ? this.contextAdvice.band : -1;
@@ -226,6 +405,11 @@ export class WatchLoopController {
 	}
 
 	shutdown(ctx: ExtensionContext, reason = "session shutdown"): void {
+		this.autoCompactAttempt += 1;
+		this.cancelAutoCompactionStart();
+		this.autoCompactInFlight = false;
+		this.autoCompactLatch = undefined;
+		this.lastCompletion = undefined;
 		this.currentContext = ctx;
 		this.apply(
 			reduceWatchLoop(this.currentState, { type: "shutdown", now: this.dependencies.now(), reason }),

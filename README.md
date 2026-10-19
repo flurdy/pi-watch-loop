@@ -40,7 +40,9 @@ Watch skills normally drive the `watch_loop` tool. Inspect the idle or active pr
 
 Other local commands are `/watch-stop` and `/watch-resume`. Set `PI_WATCH_LOOP_DISABLED=1` before starting Pi to refuse new watches while keeping status and stop access.
 
-While a watch is active, a notification suggests `/compact` once context usage reaches 50%, then again at each further 10-point band. Set `PI_WATCH_LOOP_CONTEXT_PERCENT` to another threshold from 1 to 99, or to `off`. See [context advice](docs/protocol.md#context-advice).
+While a watch is active, a notification suggests `/compact` once context usage reaches 40%, then again at each further 10-point band. Set `PI_WATCH_LOOP_CONTEXT_PERCENT` to another threshold from 1 to 99, or to `off`. See [context advice](docs/protocol.md#context-advice).
+
+To let a watch compact the session between ticks instead, opt in with `PI_WATCH_LOOP_AUTO_COMPACT=1`. It compacts once per crossing of 70% (`PI_WATCH_LOOP_AUTO_COMPACT_PERCENT`, 21 to 99) and tries again only after usage falls 20 points below that. See [automatic watch compaction](docs/protocol.md#automatic-watch-compaction).
 
 ## Development
 

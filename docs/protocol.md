@@ -96,15 +96,53 @@ while a watch is armed, running, or paused, the extension reads `ctx.getContextU
 non-blocking TUI notification suggesting `/compact` while Pi is idle once usage reaches the threshold.
 
 - `PI_WATCH_LOOP_CONTEXT_PERCENT` sets the threshold before Pi starts: an integer from 1 to 99.
-  Unset or invalid values use 50; `0` or `off` disables advice.
-- Advice repeats only for each further 10-point band, such as 50%, 60%, and 70%, per watch.
+  Unset or invalid values use 40; `0` or `off` disables advice.
+- Advice repeats only for each further 10-point band, such as 40%, 50%, and 60%, per watch.
   A lower reading, for example after compaction or a larger-window model, re-arms lower bands.
 - Unknown usage, such as immediately after compaction, stays silent. No watch means no advice.
 - Advice adds no model turn and never changes tick prompts, tool results, the footer, or protocol-v1
-  tokens. The extension never compacts; automatic compaction remains owned by Pi.
+  tokens. Advice itself never compacts; see [automatic watch compaction](#automatic-watch-compaction).
 
 Pi's `compaction.reserveTokens` setting can trigger automatic compaction earlier, but it applies to
 every session rather than only watched ones.
+
+## Automatic watch compaction
+
+Off by default. Set `PI_WATCH_LOOP_AUTO_COMPACT=1` before starting Pi to let a watch compact the
+session between ticks. `PI_WATCH_LOOP_AUTO_COMPACT_PERCENT` sets the threshold: an integer from 21
+to 99; unset or invalid values use 70. It is independent of the advice threshold.
+
+- **Only between ticks.** After `agent_settled`, the watch must be armed with no due tick, Pi must be
+  idle with no queued messages, and known usage must be at or above the threshold. A settlement that
+  dispatches a due tick, a running tick, and a paused or stopped watch never compact. Paused
+  watches still get advice.
+- **Deferred start.** Compaction starts one second after the latest settlement, after prompts that
+  extensions queued during `agent_settled` have begun. Each settlement restarts that delay, and
+  every condition is checked again for the same watch when it ends; if the watch is no longer
+  eligible, the usual advice appears instead. It calls Pi's `ctx.compact()`, the same path as
+  `/compact`, so Pi's compaction settings and `session_before_compact` hooks apply. Its model cost
+  is that of an ordinary `/compact`, usually one or more summarization requests.
+- **One attempt per crossing.** Starting an attempt latches the watch. Only a later known reading
+  below the reset level, 20 points under the threshold (50% for the default 70%), clears it.
+  Unknown usage, such as right after compaction, keeps it. A failure or still-high usage therefore
+  causes no retry loop; use `/compact` to retry sooner. A new watch starts unlatched.
+- **Notifications.** TUI notifications report the start and success as info and a failure as a
+  warning. A failure never stops or pauses the watch.
+- **Summary instructions.** The summary keeps the user's goals, ongoing work, decisions, open
+  questions and tasks unrelated to the watch. It collapses repeated tick prompts, dashboards and
+  `watch_loop` calls into the watch's current state, and records its label, watch ID, schedule and
+  next tick time, tick budget or deadline, and last completion outcome and reason.
+- **Due ticks.** A tick timer that expires during compaction records the usual due marker. When
+  compaction ends, the one-second recheck described under [compaction](#compaction) dispatches it
+  once Pi is idle; the completion callback starts that recheck again.
+- **Status.** `/watch-status` reports `Auto-compaction: off`, or the threshold and reset level with
+  `starting`, `compacting` or `waiting for context below N%`.
+
+Pi's compaction aborts any active run first, so the extension starts it only while Pi reports idle.
+A prompt submitted at that moment by the user or another extension can still overlap it: Pi rejects
+extension prompts while compaction runs, and one already past that check could start alongside it.
+The deferral and rechecks narrow this window; closing it would need host-side admission control.
+The watch's own ticks cannot overlap, because tick dispatch and the start recheck share one state.
 
 ## Compaction
 
@@ -117,6 +155,8 @@ every session rather than only watched ones.
   settles without `watch_loop complete` and follows the normal missed-completion policy.
 - **Automatic threshold or overflow compaction:** Pi compacts inside the running agent run and emits
   one final `agent_settled`, so a tick continues and completes normally without a recorded miss.
+- **Watch auto-compaction:** uses the manual path and reports reason `manual`, so the same
+  due-tick recheck applies.
 
 ## Lifecycle and cost boundary
 
